@@ -11,15 +11,18 @@ class NorfairTracker(BaseTracker):
             2. calcola la distanza euclidea tra i centroidi frame-a-frame
             3. associa in base a una soglia di distanza (non controlla le feature grafiche come DeepSORT)
         È un algoritmo molto veloce e semplice, ma è sensibiel alle occlusion e può fare ID switch facilmente"""
-    PARAMETER_SPECS = [{'name': 'par_distance_function', 'label': 'Distance function', 'type': 'text', 'default': 'euclidean'}, {'name': 'par_distance_threshold', 'label': 'Distance threshold', 'type': 'int', 'default': 50, 'min': 0, 'max': 1000, 'step': 1}]
+    PARAMETER_SPECS = [
+        {'name': 'par_distance_function', 'label': 'Distance function', 'type': 'text', 'default': 'euclidean'}, 
+        {'name': 'par_distance_threshold', 'label': 'Distance threshold', 'type': 'int', 'default': 50, 'min': 0, 'max': 1000, 'step': 1}]
 
     def __init__(self, par_distance_function="euclidean", par_distance_threshold=50):
         super().__init__("Norfair")
         self.tracker = LibNorfairTracker(par_distance_function, par_distance_threshold) # distance_threshold: soglia di associazione (in pixel)
         
-    def run(self, par_detection_data: list, par_video_path: str) -> list:
+    def run(self, par_detection_data: list, par_video_path: str, progress_callback=None) -> list:
         results = []
         start_time = time.time()
+        total_frames = len(par_detection_data)
 
         for frame_data in par_detection_data:
             frame_number = frame_data["frame_id"]
@@ -42,4 +45,7 @@ class NorfairTracker(BaseTracker):
                     "x1": cx, "y1": cy, "x2": cx, "y2": cy,
                     "time": elapsed_time
                 })
+            
+            if progress_callback is not None:
+                progress_callback(frame_number, total_frames)
         return results
