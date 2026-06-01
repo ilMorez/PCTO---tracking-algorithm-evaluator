@@ -17,7 +17,23 @@ class DeepSortTracker(BaseTracker):
         
         è un algoritmo che gestisce bene le occlusion e si comporta bene con ID changes, ma è molto lento a causa della feature extraction
     """
-    PARAMETER_SPECS = [{'name': 'par_max_iou_distance', 'label': 'Max IoU distance', 'type': 'float', 'default': 0.7, 'min': 0.0, 'max': 1.0, 'step': 0.01}, {'name': 'par_max_age', 'label': 'Max age', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1}, {'name': 'par_n_init', 'label': 'N init', 'type': 'int', 'default': 3, 'min': 1, 'max': 30, 'step': 1}, {'name': 'par_nms_max_overlap', 'label': 'NMS max overlap', 'type': 'float', 'default': 1.0, 'min': 0.0, 'max': 1.0, 'step': 0.01}, {'name': 'par_max_cosine_distance', 'label': 'Max cosine distance', 'type': 'float', 'default': 0.2, 'min': 0.0, 'max': 1.0, 'step': 0.01}, {'name': 'par_nn_budget', 'label': 'NN budget', 'type': 'text', 'default': None}, {'name': 'par_gating_only_position', 'label': 'Gating only position', 'type': 'bool', 'default': False}, {'name': 'par_override_track_class', 'label': 'Override track class', 'type': 'text', 'default': None}, {'name': 'par_embedder', 'label': 'Embedder', 'type': 'text', 'default': 'mobilenet'}, {'name': 'par_half', 'label': 'Half precision', 'type': 'bool', 'default': True}, {'name': 'par_bgr', 'label': 'Input is BGR', 'type': 'bool', 'default': True}, {'name': 'par_embedder_gpu', 'label': 'Use GPU for embedder', 'type': 'bool', 'default': True}, {'name': 'par_embedder_model_name', 'label': 'Embedder model name', 'type': 'text', 'default': None}, {'name': 'par_embedder_wts', 'label': 'Embedder weights', 'type': 'text', 'default': None}, {'name': 'par_polygon', 'label': 'Polygon mode', 'type': 'bool', 'default': False}, {'name': 'par_today', 'label': 'Today / timestamp', 'type': 'text', 'default': None}]
+    PARAMETER_SPECS = [
+        {'name': 'par_max_iou_distance', 'label': 'Max IoU distance', 'type': 'float', 'default': 0.7, 'min': 0.0, 'max': 1.0, 'step': 0.01}, 
+        {'name': 'par_max_age', 'label': 'Max age', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1}, 
+        {'name': 'par_n_init', 'label': 'N init', 'type': 'int', 'default': 3, 'min': 1, 'max': 30, 'step': 1}, 
+        {'name': 'par_nms_max_overlap', 'label': 'NMS max overlap', 'type': 'float', 'default': 1.0, 'min': 0.0, 'max': 1.0, 'step': 0.01}, 
+        {'name': 'par_max_cosine_distance', 'label': 'Max cosine distance', 'type': 'float', 'default': 0.2, 'min': 0.0, 'max': 1.0, 'step': 0.01}, 
+        {'name': 'par_nn_budget', 'label': 'NN budget', 'type': 'text', 'default': None}, 
+        {'name': 'par_gating_only_position', 'label': 'Gating only position', 'type': 'bool', 'default': False}, 
+        {'name': 'par_override_track_class', 'label': 'Override track class', 'type': 'text', 'default': None}, 
+        {'name': 'par_embedder', 'label': 'Embedder', 'type': 'text', 'default': 'mobilenet'}, 
+        {'name': 'par_half', 'label': 'Half precision', 'type': 'bool', 'default': True}, 
+        {'name': 'par_bgr', 'label': 'Input is BGR', 'type': 'bool', 'default': True}, 
+        {'name': 'par_embedder_gpu', 'label': 'Use GPU for embedder', 'type': 'bool', 'default': True}, 
+        {'name': 'par_embedder_model_name', 'label': 'Embedder model name', 'type': 'text', 'default': None}, 
+        {'name': 'par_embedder_wts', 'label': 'Embedder weights', 'type': 'text', 'default': None}, 
+        {'name': 'par_polygon', 'label': 'Polygon mode', 'type': 'bool', 'default': False}, 
+        {'name': 'par_today', 'label': 'Today / timestamp', 'type': 'text', 'default': None}]
 
     def __init__(self,
                         par_max_iou_distance=0.7,
@@ -56,7 +72,7 @@ class DeepSortTracker(BaseTracker):
                                 )
        
    
-    def run(self, par_detections_data: list, par_video_path: str) -> list:
+    def run(self, par_detections_data: list, par_video_path: str, progress_callback=None) -> list:
         """
             Esegue il tracking con DeepSORT.
             Input:
@@ -68,6 +84,7 @@ class DeepSortTracker(BaseTracker):
         results = []
         start_time = time.time()
         cap = cv2.VideoCapture(par_video_path)
+        total_frames = len(par_detections_data)
         
         for frame_data in par_detections_data:
             ret, frame = cap.read()
@@ -101,6 +118,9 @@ class DeepSortTracker(BaseTracker):
                     "x1": float(l), "y1": float(t_y), "x2": float(r), "y2": float(b),
                     "time": elapsed_time
                 })   
+            
+            if progress_callback is not None:
+                progress_callback(frame_number, total_frames)
 
         cap.release()
         return results
