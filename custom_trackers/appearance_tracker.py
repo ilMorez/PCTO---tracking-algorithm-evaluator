@@ -32,7 +32,8 @@ class AppearanceTracker(BaseTracker):
             3. associa basandosi sulla similarità
             4. aggiorna le tracks
         Si tratta di un tracker robusto ad eventuali deferomazioni, ma per funzionare been servirebbero feature neurali reali e non feature di bassa qualità (solo bbox)"""
-    PARAMETER_SPECS = [{'name': 'par_similarity_threshold', 'label': 'Similarity threshold', 'type': 'float', 'default': 0.7, 'min': 0.0, 'max': 1.0, 'step': 0.01}, {'name': 'par_max_age', 'label': 'Max age', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1}]
+    PARAMETER_SPECS = [{'name': 'par_similarity_threshold', 'label': 'Similarity threshold', 'type': 'float', 'default': 0.7, 'min': 0.0, 'max': 1.0, 'step': 0.01}, 
+                       {'name': 'par_max_age', 'label': 'Max age', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1}]
 
     def __init__(self, par_similarity_threshold=0.7, par_max_age=30):
         super().__init__("Appearance")
@@ -41,9 +42,10 @@ class AppearanceTracker(BaseTracker):
         self.tracks = []
         self.next_id = 0
 
-    def run(self, par_detection_data: list, par_video_path: str) -> list:
+    def run(self, par_detection_data: list, par_video_path: str, progress_callback=None) -> list:
         results = []
         start_time = time.time()
+        total_frames = len(par_detection_data)
         
         for frame_data in par_detection_data:
             frame_number = frame_data["frame_id"]
@@ -107,5 +109,8 @@ class AppearanceTracker(BaseTracker):
                         "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
                         "time": elapsed_time
                     })
+                    
+            if progress_callback is not None:
+                progress_callback(frame_number, total_frames)
         return results
     
