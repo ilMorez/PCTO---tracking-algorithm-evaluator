@@ -12,6 +12,11 @@ except ImportError:
     TRACKERS_LIB_AVAILABLE = False
 
 class ByteTrackTracker(BaseTracker):
+    """ Implementazione di ByteTrack, un tracker veloce e accurato che ha vinto in MOT20/21 benchmark.
+        Novità principali:
+            - usa due associazioni: HIGH-CONFIDENCE e LOW-CONFIDENCE detection
+            - recupera tracce "morte" grazie alla low-confidence detection
+        Si tratta di un tracker veloce e robusto"""
     PARAMETER_SPECS = [
         {'name': 'par_lost_track_buffer', 'label': 'Lost Track Buffer (frames)', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1},
         {'name': 'par_frame_rate', 'label': 'Frame Rate (FPS)', 'type': 'float', 'default': 30.0, 'min': 1.0, 'max': 120.0, 'step': 1.0},
@@ -43,10 +48,13 @@ class ByteTrackTracker(BaseTracker):
         else:
             self.tracker = None
     
-    def run(self, par_detection_data: list, par_video_path: str) -> list:
-        return _run_supervision_tracker(self.tracker, par_detection_data)
+    def run(self, par_detection_data: list, par_video_path: str, progress_callback=None) -> list:
+        return _run_supervision_tracker(self.tracker, par_detection_data, progress_callback)
 
 class OCSortTracker(BaseTracker):
+    """ Implementazione di OC-SORT, un tracker che va a migliorare SORT classico usando l'osservazione diretta:
+        va ad utilizzare solo la geometria, niente feature, utilizzando una strategia di associazione migliore rispetto al classico SORT.
+        Si tratta di un tracekr veloce e accurato come bytetrack, non utilizza il deep learning"""
     PARAMETER_SPECS = [
         {'name': 'par_lost_track_buffer', 'label': 'Lost Track Buffer (frames)', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1},
         {'name': 'par_frame_rate', 'label': 'Frame Rate (FPS)', 'type': 'float', 'default': 30.0, 'min': 1.0, 'max': 120.0, 'step': 1.0},
@@ -80,10 +88,14 @@ class OCSortTracker(BaseTracker):
             )
         else:
             self.tracker = None
-    def run(self, par_detection_data: list, par_video_path: str) -> list:
-        return _run_supervision_tracker(self.tracker, par_detection_data)
+    def run(self, par_detection_data: list, par_video_path: str, progress_callback=None) -> list:
+        return _run_supervision_tracker(self.tracker, par_detection_data, progress_callback)
 
 class SortTracker(BaseTracker):
+    """ Implementazione di SORT (Simple Online and Realtime Tracking), l'algorimto classico:
+            1. Ungherian algorithm per associazione centroidi
+            2. Kalman filter per previsione
+        Si tratta di un tracker smeplice e veloce, ma è sensibile all'occlusion e porta a ID switch frequenti"""
     PARAMETER_SPECS = [
         {'name': 'par_lost_track_buffer', 'label': 'Lost Track Buffer (frames)', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1},
         {'name': 'par_frame_rate', 'label': 'Frame Rate (FPS)', 'type': 'float', 'default': 30.0, 'min': 1.0, 'max': 120.0, 'step': 1.0},
@@ -111,10 +123,16 @@ class SortTracker(BaseTracker):
             )
         else:
             self.tracker = None
-    def run(self, par_detection_data: list, par_video_path: str) -> list:
-        return _run_supervision_tracker(self.tracker, par_detection_data)
+    def run(self, par_detection_data: list, par_video_path: str, progress_callback=None) -> list:
+        return _run_supervision_tracker(self.tracker, par_detection_data, progress_callback)
 
 class BoTSortTracker(BaseTracker):
+    """ Implementazione di BoT-SORT, un'estensione di SORT con feature di apaprenza tramite un feature exctractor.
+        Rispetto a SORT:
+            1 usa feature di apparenza estratte da una rete neurale
+            2. combina la distanza geometrica e la feature similarity
+            3. ha accesso al frame grezzo proprio come DeepSORT
+        Si tratta di un buon equilibrio tra velocità ed accuratezza, andando però a richeidere una GPU per avere prestazioni elevate."""
     PARAMETER_SPECS = [
         {'name': 'par_lost_track_buffer', 'label': 'Lost Track Buffer (frames)', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1},
         {'name': 'par_frame_rate', 'label': 'Frame Rate (FPS)', 'type': 'float', 'default': 30.0, 'min': 1.0, 'max': 120.0, 'step': 1.0},
@@ -163,10 +181,11 @@ class BoTSortTracker(BaseTracker):
             )
         else:
             self.tracker = None
-    def run(self, par_detection_data: list, par_video_path: str) -> list:
+    def run(self, par_detection_data: list, par_video_path: str, progress_callback=None) -> list:
         if self.tracker is None: return []
         results, start_time = [], time.time()
         cap = cv2.VideoCapture(par_video_path)
+        total_frames = len(par_detection_data)
         for frame_data in par_detection_data:
             ret, frame = cap.read()
             if not ret: break
@@ -179,12 +198,15 @@ class BoTSortTracker(BaseTracker):
                 for i in range(len(tracked_dets.xyxy)):
                     x1, y1, x2, y2 = tracked_dets.xyxy[i]
                     results.append({"frame": frame_number, "track_id": int(tracked_dets.tracker_id[i]), "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2), "time": time.time() - start_time})
+            if progress_callback is not None:
+                progress_callback(frame_number, total_frames)
         cap.release()
         return results
 
-def _run_supervision_tracker(tracker_instance, par_detection_data):
+def _run_supervision_tracker(tracker_instance, par_detection_data, progress_callback=None):
     if tracker_instance is None: return []
     results, start_time = [], time.time()
+    total_frames = len(par_detection_data)
     for frame_data in par_detection_data:
         frame_number = frame_data["frame_id"]
         if frame_number % FRAME_SKIP != 0: continue
@@ -195,4 +217,6 @@ def _run_supervision_tracker(tracker_instance, par_detection_data):
             for i in range(len(tracked_dets.xyxy)):
                 x1, y1, x2, y2 = tracked_dets.xyxy[i]
                 results.append({"frame": frame_number, "track_id": int(tracked_dets.tracker_id[i]), "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2), "time": time.time() - start_time})
+        if progress_callback is not None:
+            progress_callback(frame_number, total_frames)
     return results
