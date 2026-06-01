@@ -21,7 +21,8 @@ class VelocityTracker(BaseTracker):
             4. viene aggiornata la track
         Si tratta di un tracker smeplice, veloce e che funziona bene con oggeti con movimento uniforme,
         ma non gestisce l'eventuale accelerazione ed è sensibile all'occlusion"""
-    PARAMETER_SPECS = [{'name': 'par_distance_threshold', 'label': 'Distance threshold', 'type': 'int', 'default': 100, 'min': 0, 'max': 1000, 'step': 1}, {'name': 'par_max_age', 'label': 'Max age', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1}]
+    PARAMETER_SPECS = [{'name': 'par_distance_threshold', 'label': 'Distance threshold', 'type': 'int', 'default': 100, 'min': 0, 'max': 1000, 'step': 1}, 
+                       {'name': 'par_max_age', 'label': 'Max age', 'type': 'int', 'default': 30, 'min': 1, 'max': 300, 'step': 1}]
 
     def __init__(self, par_distance_threshold=100, par_max_age=30):
         super().__init__("Velocity")
@@ -33,9 +34,10 @@ class VelocityTracker(BaseTracker):
     def center(self, box):
         return np.array([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2])
 
-    def run(self, par_detection_data: list, par_video_path: str) -> list:
+    def run(self, par_detection_data: list, par_video_path: str, progress_callback=None) -> list:
         results = []
         start_time = time.time()
+        total_frames = len(par_detection_data)
         
         for frame_data in par_detection_data:
             frame_number = frame_data["frame_id"]
@@ -94,4 +96,7 @@ class VelocityTracker(BaseTracker):
                         "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
                         "time": elapsed_time
                     })
+                    
+            if progress_callback is not None:
+                progress_callback(frame_number, total_frames)
         return results
