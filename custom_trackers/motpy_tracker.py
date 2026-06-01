@@ -16,9 +16,11 @@ class MotpyTracker(BaseTracker):
         super().__init__("Motpy")
         self.tracker = MultiObjectTracker(dt=par_dt)
         
-    def run(self, par_detection_data: list, par_video_path: str) -> list:
+    def run(self, par_detection_data: list, par_video_path: str, progress_callback=None) -> list:
         results = []
         start_time = time.time()    
+        total_frames = len(par_detection_data)
+        
         for frame_data in par_detection_data:
             frame_number = frame_data["frame_id"]
             
@@ -44,5 +46,8 @@ class MotpyTracker(BaseTracker):
                     "x2": float(x2), "y2": float(y2),
                         "time": elapsed_time
                 })
+                
+            if progress_callback is not None:
+                progress_callback(frame_number, total_frames)
         return results
    
