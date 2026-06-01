@@ -23,7 +23,7 @@ class Visualizer:
         self.output_dir = Path(par_output_dir)
         self. output_dir.mkdir(parents=True, exist_ok=True) # Crea la cartella di output se non esiste
         
-    def draw_tracks(self, par_csv_path: str, par_output_video_name: str, par_video_path: str):
+    def draw_tracks(self, par_csv_path: str, par_output_video_name: str, par_video_path: str, progress_callback = None):
         """ Crea un video annotato con i track disegnati:
                 1. legge il CSV con tutti i track
                 2. apre il video originale
@@ -43,6 +43,7 @@ class Visualizer:
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps    = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         out_path = self.output_dir / par_output_video_name
         out = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
@@ -66,6 +67,9 @@ class Visualizer:
             
             out.write(frame)
             frame_id += 1
+            
+            if progress_callback is not None and total_frames > 0:
+                progress_callback(frame_id, total_frames)
             
         cap.release()
         out.release()
@@ -161,12 +165,13 @@ class Visualizer:
         plt.savefig(self.output_dir / "processing_time.png", dpi=150)
         plt.close()
 
-    def draw_raw_detections(self, par_detections_data: list, par_output_video_name: str, par_video_path: str):
+    def draw_raw_detections(self, par_detections_data: list, par_output_video_name: str, par_video_path: str, progress_callback = None):
         """ Crea un video annotato con le sole detection grezze di YOLO (BBox Blu + Confidenza) """
         cap = cv2.VideoCapture(par_video_path)
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps    = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         out_path = self.output_dir / par_output_video_name
         out = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
@@ -187,6 +192,9 @@ class Visualizer:
 
             out.write(frame)
             frame_id += 1
+            
+            if progress_callback is not None and total_frames > 0:
+                progress_callback(frame_id, total_frames)
 
         cap.release()
         out.release()
