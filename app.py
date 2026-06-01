@@ -18,14 +18,37 @@ UPLOAD_DIR = Path("uploaded_videos")
 OUTPUT_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-def converti_in_h264(par_input_path: Path, par_output_path: Path):
+def converti_in_h264(par_input_path: Path, par_output_path: Path, desc="Conversione Video"):
     if not par_input_path.exists():
         return False
 
     try:
+        from proglog import ProgressBarLogger
+        
+        status_text = st.empty()
+        progress_bar = st.progress(0.0)
+        
+        class StreamlitMoviePyLogger(ProgressBarLogger):
+            def bars_callback(self, bar, attr, value, old_value=None):
+                if bar in self.bars:
+                    total = self.bars[bar].get('total', 0)
+                    if total > 0:
+                        percentage = value / total
+                        progress_bar.progress(min(float(percentage), 1.0))
+                        status_text.text(f"{desc}: {value}/{total} frame ({int(percentage * 100)}%)")
+        custom_logger = StreamlitMoviePyLogger()
+        
         clip = VideoFileClip(str(par_input_path))
-        clip.write_videofile(str(par_output_path), codec="libx264", audio=False, logger=None)
+        clip.write_videofile(
+            str(par_output_path), 
+            codec="libx264", 
+            audio=False, 
+            logger=custom_logger
+        )
         clip.close()
+        
+        status_text.empty()
+        progress_bar.empty()
         return True
 
     except Exception as e:
@@ -117,18 +140,33 @@ def render_tracker_parameters(tracker_cls, tracker_key: str):
 
 uploaded_file = st.file_uploader("Carica un file video (.mp4):", type=["mp4"])
 if uploaded_file is not None:
+    peso = uploaded_file.size
+    video_stem = Path(uploaded_file.name).stem
+    nuovo_nome = f"{video_stem}_{peso}.mp4"
+    video_salvato_path = UPLOAD_DIR / nuovo_nome
 
-    video_salvato_path = UPLOAD_DIR / uploaded_file.name
     with open(video_salvato_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
+
     video_output_folder = OUTPUT_DIR / video_salvato_path.stem
     video_output_folder.mkdir(parents=True, exist_ok=True)
     detections_json_path = video_output_folder / "detections.json"
 
     if not detections_json_path.exists():
-        with st.spinner("YOLO sta estraendo le Bounding Box dal video..."):
-            detector = Detector()
-            detector.run_detection(str(video_salvato_path), str(detections_json_path))
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        def update_ui(current_frame, total_frames):
+            percentuale = min(current_frame / total_frames, 1.0)
+            progress_bar.progress(percentuale)
+            status_text.text(f"Elaborazione frame: {current_frame} / {total_frames}")
+
+        detector = Detector()
+        detector.run_detection(
+            str(video_salvato_path), 
+            str(detections_json_path),
+            progress_callback=update_ui
+        )
 
     with open(detections_json_path, "r") as f:
         detections_data = json.load(f)
@@ -136,7 +174,6 @@ if uploaded_file is not None:
     col_video_or, col_video_dett = st.columns(2)
 
     with col_video_or:
-        st.markdown(f'Video: "{video_salvato_path.stem}"')
         st.video(video_salvato_path)
 
     with col_video_dett:
@@ -167,19 +204,63 @@ if uploaded_file is not None:
     video_tracked_converted = video_output_folder / f"{tracker_type.lower()}_h264.mp4"
 
     if st.button("Avvia Elaborazione"):
-        with st.spinner(f"Applicazione di {tracker_type} e generazione video in corso..."):
+        visualizer = Visualizer(par_output_dir=str(video_output_folder))
+        placeholder_tracker = st.empty()
+        
+        with placeholder_tracker.container():
+            bar_tracker = st.progress(0)
+            text_tracker = st.empty()
+
+            def update_tracker_ui(current_frame, total_frames):
+                pct = min(current_frame / total_frames, 1.0)
+                bar_tracker.progress(pct)
+                text_tracker.text(f"{tracker_type}: elaborazione frame {current_frame} / {total_frames}")
+
             tracker_inst = TrackerClass(**tracker_kwargs)
             tracker_inst.setup_video_paths(video_salvato_path.name)
-            risultati = tracker_inst.run(detections_data, str(video_salvato_path))
+            risultati = tracker_inst.run(detections_data, str(video_salvato_path), progress_callback=update_tracker_ui)
             tracker_inst.save_to_csv(risultati)
+            
+        placeholder_tracker.empty()
+        placeholder_annot_track = st.empty()
+        
+        with placeholder_annot_track.container():
+            st.info("Generazione del video finale tracciato...")
+            bar_annot = st.progress(0)
+            text_annot = st.empty()
 
-            visualizer = Visualizer(par_output_dir=str(video_output_folder))
+            def update_annot_track_ui(current_frame, total_frames):
+                pct = min(current_frame / total_frames, 1.0)
+                bar_annot.progress(pct)
+                text_annot.text(f"Disegno tracce ({tracker_type}): frame {current_frame} / {total_frames}")
+
             print("Annotazione video tracker")
-            visualizer.draw_tracks(str(tracker_inst.csv_path), video_tracked_filename, str(video_salvato_path))
+            visualizer.draw_tracks(str(tracker_inst.csv_path), video_tracked_filename, str(video_salvato_path), progress_callback=update_annot_track_ui)
+
             converti_in_h264(video_tracked_path, video_tracked_converted)
-            print("Annotazione video YOLO")
-            visualizer.draw_raw_detections(detections_data, "raw_detections.mp4", video_salvato_path)
-            converti_in_h264(video_raw_path, video_raw_converted)
+        placeholder_annot_track.empty()
+
+        if not video_raw_converted.exists():
+            placeholder_annot_yolo = st.empty()
+            
+            with placeholder_annot_yolo.container():
+                st.info("Generazione del video con i rilevamenti YOLO grezzi...")
+                bar_yolo = st.progress(0)
+                text_yolo = st.empty()
+
+                def update_annot_yolo_ui(current_frame, total_frames):
+                    pct = min(current_frame / total_frames, 1.0)
+                    bar_yolo.progress(pct)
+                    text_yolo.text(f"Disegno Bounding Box YOLO: frame {current_frame} / {total_frames}")
+
+                print("Annotazione video YOLO")
+                visualizer.draw_raw_detections(detections_data, "raw_detections.mp4", video_salvato_path, progress_callback=update_annot_yolo_ui)
+                
+                text_yolo.text("Conversione formato video YOLO in corso (H264)...")
+                converti_in_h264(video_raw_path, video_raw_converted)
+            placeholder_annot_yolo.empty()
+        else:
+            print("Video YOLO grezzo già presente.")
 
     v_col1, v_col2 = st.columns(2)
     with v_col1:
