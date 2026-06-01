@@ -23,7 +23,7 @@ class BaseTracker(ABC):
         self.output_dir = Path(par_output_dir)
         
     @abstractmethod
-    def run(self, detections: list) -> list:
+    def run(self, detections: list, progress_callback=None) -> list:
         """ Metodo astratto che esegue l'algoritmo di tracking sulle detection di un video.
                 Input:
                     detections: lista di frame con detections YOLO nel formato: [{"frame_id": 0, "detections": [[x1, y1, x2, y2, conf], ...]}, ...]
