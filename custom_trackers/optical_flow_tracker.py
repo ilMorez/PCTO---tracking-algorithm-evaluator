@@ -20,10 +20,11 @@ class OpticalFlowTracker(BaseTracker):
         super().__init__("OpticalFlow")
         self.bbox_size = par_bbox_size
 
-    def run(self, par_detection_data: list, par_video_path: str) -> list:
+    def run(self, par_detection_data: list, par_video_path: str, progress_callback=None) -> list:
         results = []
         start_time = time.time()
         cap = cv2.VideoCapture(par_video_path)
+        total_frames = len(par_detection_data)
         
         prev_gray = None # Frame precedente in scala di grigi
         
@@ -63,6 +64,9 @@ class OpticalFlowTracker(BaseTracker):
                             "x2": float(cx + 15), "y2": float(cy + 15),
                             "time": elapsed_time
                         })
+                
+                if progress_callback is not None:
+                    progress_callback(frame_number, total_frames)
             
             prev_gray = gray
             
