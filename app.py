@@ -261,7 +261,6 @@ if uploaded_file is not None:
                     print("Annotazione video YOLO")
                     visualizer.draw_raw_detections(detections_data, "raw_detections.mp4", video_salvato_path, progress_callback=update_annot_yolo_ui)
                     
-                    text_yolo.text("Conversione formato video YOLO in corso (H264)...")
                     converti_in_h264(video_raw_path, video_raw_converted)
                 placeholder_annot_yolo.empty()
             else:
