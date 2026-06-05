@@ -32,7 +32,7 @@ class Detector:
         self.model = YOLO(par_model_path)
         self.target_class = TARGET_CLASS
         
-    def run_detection(self, par_video_path: str, par_output_json: str = "output/detections.json"):
+    def run_detection(self, par_video_path: str, par_output_json: str = "output/detections.json", progress_callback = None):
         """ Esegue il rilevamento degli oggetti su un video intero:
                 1. apre il video file
                 2. per ogni frame:
@@ -55,7 +55,8 @@ class Detector:
         frame_number = 0
 
         cap = cv2.VideoCapture(par_video_path)
-
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
         for result in self.model(source=par_video_path, stream=True, verbose=False): # result è un oggetto Results di YOLO che contiene: result.boxes: lista di bounding box rilevate nel frame, result.names: dizionario {class_id: class_name}
             timestamp  = cap.get(cv2.CAP_PROP_POS_MSEC)
             detections = []
@@ -79,6 +80,9 @@ class Detector:
             }
             
             dataset.append(frames_dict)
+            
+            if progress_callback is not None and total_frames > 0:
+                progress_callback(frame_number, total_frames)
             
             if frame_number % 50 == 0:
                 print(f"\tDetection: elaborati {frame_number} frame")
