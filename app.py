@@ -7,7 +7,7 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from custom_trackers import TRACKER_REGISTRY
 from visualization import Visualizer
 from evaluator import TrackerEvaluator
-from detection import Detector
+import requests
 
 st.set_page_config(page_title="Dashboard Comparazione Video", layout="wide")
 st.title("Comparazione BBox Grezze vs Video Tracciato")
@@ -17,6 +17,107 @@ OUTPUT_DIR = Path("output")
 UPLOAD_DIR = Path("uploaded_videos")
 OUTPUT_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Configurazione server (sidebar) — unica aggiunta alla grafica originale
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("Configurazione Server")
+    SERVER_URL = st.text_input(
+        "URL del server",
+        value="http://localhost:8000",
+        help="Indirizzo base del server FastAPI"
+    ).rstrip("/")
+
+    st.markdown("---")
+    st.header("Modello YOLO")
+    YOLO_MODELS = [
+        "yolo26n.pt",
+        "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
+        "yolov9c.pt", "yolov9e.pt",
+        "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
+    ]
+    selected_model = st.selectbox("Modello YOLO", YOLO_MODELS, index=0)
+    custom_model = st.text_input(
+        "Oppure path/nome modello custom",
+        value="",
+        help="Lascia vuoto per usare il modello selezionato sopra"
+    ).strip()
+    model_name = custom_model if custom_model else selected_model
+
+    st.markdown("##### Parametri inferenza")
+    yolo_conf    = st.slider("Confidence threshold", 0.01, 1.0, 0.25, 0.01)
+    yolo_iou     = st.slider("IoU threshold (NMS)",  0.01, 1.0, 0.45, 0.01)
+    yolo_imgsz   = st.selectbox("imgsz", [320, 416, 480, 640, 768, 1024, 1280], index=3)
+    yolo_half    = st.checkbox("Half precision (FP16)", value=False)
+    yolo_verbose = st.checkbox("Verbose YOLO", value=False)
+
+    yolo_params = {
+        "conf": yolo_conf, "iou": yolo_iou, "imgsz": yolo_imgsz,
+        "half": yolo_half, "stream": True, "verbose": yolo_verbose,
+    }
+
+def server_detect(video_path: Path, model_name: str, yolo_params: dict) -> list | None:
+    endpoint = f"{SERVER_URL}/api/detect"
+    try:
+        with open(video_path, "rb") as vf:
+            resp = requests.post(
+                endpoint,
+                data={"model_name": model_name, "yolo_params_json": json.dumps(yolo_params)},
+                files={"video": (video_path.name, vf, "video/mp4")},
+                timeout=600,
+                proxies={"http": None, "https": None},
+            )
+        try:
+            data = resp.json()
+        except Exception:
+            st.error(f"Risposta non JSON [{resp.status_code}]:\n```\n{resp.text[:1000]}\n```")
+            return None
+        if resp.status_code != 200:
+            st.error(f"Errore `/api/detect` [{resp.status_code}]:\n```\n{data.get('detail', resp.text)}\n```")
+            return None
+        return data.get("detections")
+    except requests.exceptions.ConnectionError:
+        st.error(f"Impossibile connettersi al server: `{endpoint}`")
+        return None
+    except Exception as e:
+        st.error(f"Errore `/api/detect`:\n```\n{e}\n```")
+        return None
+
+
+def server_track(video_path: Path, tracker_name: str, detections_data: list, tracker_params: dict):
+    endpoint = f"{SERVER_URL}/api/track"
+    try:
+        with open(video_path, "rb") as vf:
+            resp = requests.post(
+                endpoint,
+                data={
+                    "tracker_name":        tracker_name,
+                    "detections_json":     json.dumps(detections_data),
+                    "tracker_params_json": json.dumps(tracker_params),
+                },
+                files={"video": (video_path.name, vf, "video/mp4")},
+                timeout=600,
+                proxies={"http": None, "https": None},
+            )
+        try:
+            data = resp.json()
+        except Exception:
+            st.error(
+                f"Il server ha risposto con stato **{resp.status_code}** ma la risposta non è JSON.\n\n"
+                f"**Risposta grezza:**\n```\n{resp.text[:1000]}\n```"
+            )
+            return None
+        if resp.status_code != 200:
+            st.error(f"Errore server `/api/track` [{resp.status_code}]:\n```\n{data.get('detail', resp.text)}\n```")
+            return None
+        return data.get("tracking_results")
+    except requests.exceptions.ConnectionError:
+        st.error(f"Impossibile connettersi al server: `{endpoint}`\nVerifica che sia avviato e che l'URL sia corretto.")
+        return None
+    except Exception as e:
+        st.error(f"Errore imprevisto nella chiamata `/api/track`:\n```\n{e}\n```")
+        return None
 
 def converti_in_h264(par_input_path: Path, par_output_path: Path, desc="Conversione Video"):
     if not par_input_path.exists():
@@ -57,7 +158,7 @@ def converti_in_h264(par_input_path: Path, par_output_path: Path, desc="Conversi
 
 def calcola_metriche_csv(csv_path):
     try:
-        df_temp = pd.read_csv(csv_path)
+        df_temp = pd.read_csv(csv_path, comment='#')
         total_frames = int(df_temp["frame"].max() + 1) if not df_temp.empty else 1
         evaluator = TrackerEvaluator(par_total_frames=total_frames)
         return evaluator.evaluate(str(csv_path))
@@ -138,6 +239,9 @@ def render_tracker_parameters(tracker_cls, tracker_key: str):
 
     return tracker_kwargs
 
+# ---------------------------------------------------------------------------
+# UI principale — identica all'originale
+# ---------------------------------------------------------------------------
 uploaded_file = st.file_uploader("Carica un file video (.mp4):", type=["mp4"])
 
 if uploaded_file is not None:
@@ -149,25 +253,20 @@ if uploaded_file is not None:
     with open(video_salvato_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    video_output_folder = OUTPUT_DIR / video_salvato_path.stem
+    # cartella output include il modello così cache detection diverse non collidono
+    model_slug = model_name.replace(".pt", "").replace("/", "_").replace("\\", "_")
+    video_output_folder = OUTPUT_DIR / f"{video_salvato_path.stem}__{model_slug}"
     video_output_folder.mkdir(parents=True, exist_ok=True)
     detections_json_path = video_output_folder / "detections.json"
 
     if not detections_json_path.exists():
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        def update_ui(current_frame, total_frames):
-            percentuale = min(current_frame / total_frames, 1.0)
-            progress_bar.progress(percentuale)
-            status_text.text(f"Elaborazione frame: {current_frame} / {total_frames}")
+        with st.spinner(f"Detection in corso sul server con **{model_name}**…"):
+            detections_data = server_detect(video_salvato_path, model_name, yolo_params)
+        if detections_data is None:
+            st.stop()
+        with open(detections_json_path, "w") as f:
+            json.dump(detections_data, f, indent=4)
 
-        detector = Detector()
-        detector.run_detection(
-            str(video_salvato_path), 
-            str(detections_json_path),
-            progress_callback=update_ui
-        )
 
     with open(detections_json_path, "r") as f:
         detections_data = json.load(f)
@@ -213,20 +312,26 @@ if uploaded_file is not None:
             placeholder_tracker = st.empty()
             
             with placeholder_tracker.container():
-                bar_tracker = st.progress(0)
-                text_tracker = st.empty()
+                st.info(f"Invio richiesta di tracking **{tracker_type}** al server…")
+                with st.spinner("Tracking in corso sul server…"):
+                    risultati = server_track(
+                        video_salvato_path,
+                        tracker_type,
+                        detections_data,
+                        tracker_kwargs,
+                    )
 
-                def update_tracker_ui(current_frame, total_frames):
-                    pct = min(current_frame / total_frames, 1.0)
-                    bar_tracker.progress(pct)
-                    text_tracker.text(f"{tracker_type}: elaborazione frame {current_frame} / {total_frames}")
-
-                tracker_inst = TrackerClass(**tracker_kwargs)
-                tracker_inst.setup_video_paths(video_salvato_path.name)
-                risultati = tracker_inst.run(detections_data, str(video_salvato_path), progress_callback=update_tracker_ui)
-                tracker_inst.save_to_csv(risultati)
-                
             placeholder_tracker.empty()
+
+            if risultati is None:
+                st.stop()
+
+            # Salva CSV localmente per metriche e visualizzazione
+            tracker_inst = TrackerClass(**tracker_kwargs)
+            tracker_inst.output_dir = video_output_folder.parent
+            tracker_inst.setup_video_paths(video_output_folder.name)
+            tracker_inst.save_to_csv(risultati, params=tracker_kwargs)
+
             placeholder_annot_track = st.empty()
             
             with placeholder_annot_track.container():
@@ -286,9 +391,9 @@ if uploaded_file is not None:
         
         metriche_globali = {}
         for nome_tracker in TRACKER_REGISTRY.keys():
-            csv_tracker = video_output_folder / f"{nome_tracker.lower()}.csv"
-            if csv_tracker.exists():
-                metriche = calcola_metriche_csv(csv_tracker)
+            csv_files = sorted(video_output_folder.glob(f"{nome_tracker.lower()}_*.csv"))
+            if csv_files:
+                metriche = calcola_metriche_csv(csv_files[-1])  # prende l'ultimo
                 if metriche:
                     metriche_globali[nome_tracker.upper()] = metriche
 
@@ -343,7 +448,6 @@ if uploaded_file is not None:
                     st.markdown(f"##### {label_1}")
                     st.bar_chart(df_comparativo[col_1], color=colore_1, height=450)
                 
-                # Secondo grafico della riga (se presente nella lista)
                 if i + 1 < len(colonne_disponibili):
                     col_2 = colonne_disponibili[i+1]
                     label_2 = mappa_nomi_metriche.get(col_2, col_2.replace("_", " ").title())
