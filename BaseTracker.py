@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
+from datetime import datetime
 from pathlib import Path
 import csv
+import json
 
 class BaseTracker(ABC):
     """ Classe astratta BASE TRACKER, si coccupa di:
@@ -46,9 +48,9 @@ class BaseTracker(ABC):
         """
         video_folder = self.output_dir / Path(par_video_name).stem # Path.stem estrae il nome del file senza estensione
         video_folder.mkdir(parents=True, exist_ok=True) # Crea la cartella (parents=True crea anche le parent directories se non esistono, exist_ok=True evita errore se la cartella esiste già)
-        self.csv_path = video_folder / f"{self.name.lower()}.csv" # Salva il path completo del CSV di questo tracker per questo video
+        self.video_folder = video_folder
     
-    def save_to_csv(self, results: list):
+    def save_to_csv(self, results: list, params: dict = None):
         """ Salva i risultati del tracking in un file CSV standardizzato:
             il file CSV ha sempre lo stesso formato per permettere all'evaluator di calcolare le metriche in modo uniforme.
             Formato CSV:
@@ -59,9 +61,14 @@ class BaseTracker(ABC):
                 results: lista di dizionari con le tracce tracciate
                         ogni elemento: {"frame": int, "track_id": int, "x1": float, "y1": float, "x2": float, "y2": float, "time": float}
         """
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.csv_path = self.video_folder / f"{self.name.lower()}_{timestamp}.csv"
         header_names = ["frame", "track_id", "x1", "y1", "x2", "y2", "time"]
-        with open(self.csv_path, "w", newline="") as file: # Apre il file in modalità WRITE (sovrascrive)
-            writer = csv.DictWriter(file, fieldnames=header_names) # Crea un writer che scrive dizionari come righe CSV
+        with open(self.csv_path, "w", newline="") as file:
+            if params:
+                file.write(f"# params: {json.dumps(params)}\n")
+            writer = csv.DictWriter(file, fieldnames=header_names)
             writer.writeheader()
             writer.writerows(results)
             print(f"Risultati di {self.name} salvati in {self.csv_path}")
