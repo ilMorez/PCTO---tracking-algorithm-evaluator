@@ -49,7 +49,7 @@ class Visualizer:
         out = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
         
         try:
-            df = pd.read_csv(par_csv_path)
+            df = pd.read_csv(par_csv_path, comment='#')
         except Exception:
             df = pd.DataFrame(columns=["frame", "track_id", "x1", "y1", "x2", "y2"])
 
