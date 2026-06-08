@@ -86,41 +86,45 @@ class DeepSortTracker(BaseTracker):
         cap = cv2.VideoCapture(par_video_path)
         total_frames = len(par_detections_data)
         
-        for frame_data in par_detections_data:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        try:
+            for frame_data in par_detections_data:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_number = frame_data["frame_id"]
-            if frame_number % FRAME_SKIP != 0:
-                continue
-            if frame_number % 50 == 0:
-                print(f"\tDeepSORT frame {frame_number}")
-                
-            # Converte le detection nel formato atteso da DeepSORT:
-            # [x1, y1, width, height] (NOT [x1, y1, x2, y2])
-            deepsort_input = [
-                ([x1, y1, x2 - x1, y2 - y1], conf, TARGET_CLASS)
-                for x1, y1, x2, y2, conf in frame_data["detections"]
-            ]
-            
-            # Aggiorna il tracker con le nuove detection
-            # DeepSORT estrae le feature dal frame e associa alle tracce
-            for t in self.tracker.update_tracks(deepsort_input, frame=frame_rgb):
-                if not t.is_confirmed(): # Filtra tracce confermate (scarta tracce nuove non ancora sicure)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_number = frame_data["frame_id"]
+                if frame_number % FRAME_SKIP != 0:
                     continue
-                l, t_y, r, b = t.to_ltrb() # Estrae le coordinate (formato [left, top, right, bottom])  streamlit run app.py
-                elapsed_time = time.time() - start_time
-                results.append({
-                    "frame": frame_number, 
-                    "track_id": int(t.track_id),
-                    "x1": float(l), "y1": float(t_y), "x2": float(r), "y2": float(b),
-                    "time": elapsed_time
-                })   
+                if frame_number % 50 == 0:
+                    print(f"\tDeepSORT frame {frame_number}")
+                    
+                deepsort_input = [
+                    ([x1, y1, x2 - x1, y2 - y1], conf, TARGET_CLASS)
+                    for x1, y1, x2, y2, conf in frame_data["detections"]
+                ]
+                
+                for t in self.tracker.update_tracks(deepsort_input, frame=frame_rgb):
+                    if not t.is_confirmed(): 
+                        continue
+                    if t.time_since_update > 0:
+                        continue
+                    
+                    l, t_y, r, b = t.to_ltrb(orig=True)
+                    
+                    elapsed_time = time.time() - start_time
+                    results.append({
+                        "frame": frame_number, 
+                        "track_id": int(t.track_id),
+                        "x1": float(l), "y1": float(t_y), "x2": float(r), "y2": float(b),
+                        "time": elapsed_time
+                    })   
+                
+                if progress_callback is not None:
+                    progress_callback(frame_number, total_frames)
+                    
+        finally:
+            print("Rilascio della risorsa VideoCapture in corso...")
+            cap.release()
             
-            if progress_callback is not None:
-                progress_callback(frame_number, total_frames)
-
-        cap.release()
         return results
