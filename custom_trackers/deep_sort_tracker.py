@@ -26,14 +26,17 @@ class DeepSortTracker(BaseTracker):
         {'name': 'par_nn_budget', 'label': 'NN budget', 'type': 'text', 'default': None}, 
         {'name': 'par_gating_only_position', 'label': 'Gating only position', 'type': 'bool', 'default': False}, 
         {'name': 'par_override_track_class', 'label': 'Override track class', 'type': 'text', 'default': None}, 
-        {'name': 'par_embedder', 'label': 'Embedder', 'type': 'text', 'default': 'mobilenet'}, 
+        {'name': 'par_embedder', 'label': 'Embedder', 'type': 'select', 'default': 'mobilenet', 'options': ['mobilenet', 'efficientnet', 'resnet']}, 
         {'name': 'par_half', 'label': 'Half precision', 'type': 'bool', 'default': True}, 
         {'name': 'par_bgr', 'label': 'Input is BGR', 'type': 'bool', 'default': True}, 
         {'name': 'par_embedder_gpu', 'label': 'Use GPU for embedder', 'type': 'bool', 'default': True}, 
         {'name': 'par_embedder_model_name', 'label': 'Embedder model name', 'type': 'text', 'default': None}, 
         {'name': 'par_embedder_wts', 'label': 'Embedder weights', 'type': 'text', 'default': None}, 
         {'name': 'par_polygon', 'label': 'Polygon mode', 'type': 'bool', 'default': False}, 
-        {'name': 'par_today', 'label': 'Today / timestamp', 'type': 'text', 'default': None}]
+        {'name': 'par_today', 'label': 'Today / timestamp', 'type': 'text', 'default': None},
+        
+        {'name': 'par_orig', 'label': 'Usa coordinate originali (orig)', 'type': 'bool', 'default': True}
+    ]
 
     def __init__(self,
                         par_max_iou_distance=0.7,
@@ -51,7 +54,8 @@ class DeepSortTracker(BaseTracker):
                         par_embedder_model_name=None,
                         par_embedder_wts=None,
                         par_polygon=False,
-                        par_today=None,):
+                        par_today=None,
+                        par_orig=True,):
         super().__init__(par_name="DeepSORT")    
         self.tracker = DeepSort(max_iou_distance=par_max_iou_distance,
                                 max_age=par_max_age,
@@ -70,6 +74,7 @@ class DeepSortTracker(BaseTracker):
                                 polygon=par_polygon,
                                 today=par_today
                                 )
+        self.orig = par_orig
        
    
     def run(self, par_detections_data: list, par_video_path: str, progress_callback=None) -> list:
@@ -110,7 +115,7 @@ class DeepSortTracker(BaseTracker):
                     if t.time_since_update > 0:
                         continue
                     
-                    l, t_y, r, b = t.to_ltrb(orig=True)
+                    l, t_y, r, b = t.to_ltrb(orig=self.orig)
                     
                     elapsed_time = time.time() - start_time
                     results.append({
