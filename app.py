@@ -58,6 +58,14 @@ with st.sidebar:
         "half": yolo_half, "stream": True, "verbose": yolo_verbose,
     }
 
+    st.markdown("---")
+    st.header("Ground Truth (opzionale)")
+    gt_file = st.file_uploader(
+        "Carica file ground truth (.txt, formato MOT):",
+        type=["txt"],
+        help="Formato atteso: frame, track_id, x, y, w, h, conf, class, visibility",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Chiamate server
@@ -165,6 +173,66 @@ def calcola_metriche_csv(csv_path: Path):
         return None
 
 
+def parse_gt_file(gt_file_obj) -> pd.DataFrame | None:
+    """Parsifica un file ground truth in formato MOT e ritorna un DataFrame.
+    Colonne attese: frame, track_id, x, y, w, h, conf, class, visibility.
+    Righe con track_id == -1 (oggetti ignorati) vengono escluse.
+    """
+    try:
+        content = gt_file_obj.read().decode("utf-8")
+        rows = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 6:
+                continue
+            frame_id = int(float(parts[0]))
+            track_id = int(float(parts[1]))
+            if track_id == -1:
+                continue
+            x, y, w, h = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
+            rows.append({"frame": frame_id, "track_id": track_id, "x": x, "y": y, "w": w, "h": h})
+        if not rows:
+            return None
+        return pd.DataFrame(rows)
+    except Exception:
+        return None
+
+
+def calcola_metriche_gt(gt_df: pd.DataFrame) -> dict:
+    """Calcola metriche di base direttamente dal DataFrame ground truth."""
+    total_frames = int(gt_df["frame"].max()) + 1
+    unique_tracks = gt_df["track_id"].nunique()
+    track_lengths = gt_df.groupby("track_id")["frame"].count()
+    avg_len = float(track_lengths.mean())
+    max_len = int(track_lengths.max())
+    total_det = len(gt_df)
+    avg_lifetime = float(
+        gt_df.groupby("track_id").apply(lambda g: g["frame"].max() - g["frame"].min() + 1).mean()
+    )
+    max_lifetime = int(
+        gt_df.groupby("track_id").apply(lambda g: g["frame"].max() - g["frame"].min() + 1).max()
+    )
+    track_coverage = (total_det / (unique_tracks * total_frames) * 100) if unique_tracks > 0 else 0.0
+    return {
+        "num_tracks": unique_tracks,
+        "total_detections": total_det,
+        "avg_track_length": round(avg_len, 2),
+        "max_track_length": max_len,
+        "avg_id_lifetime": round(avg_lifetime, 2),
+        "max_id_lifetime": max_lifetime,
+        "track_coverage": round(track_coverage, 4),
+        # GT non ha ID switches, fragmentation, ecc. — riempiamo con NaN
+        "id_switches": float("nan"),
+        "fragmentation": float("nan"),
+        "kinematic_jumps": float("nan"),
+        "spurious_tracks_ratio": float("nan"),
+        "time": float("nan"),
+    }
+
+
 def render_tracker_parameters(tracker_cls, tracker_key: str):
     specs          = getattr(tracker_cls, "PARAMETER_SPECS", [])
     tracker_kwargs = {}
@@ -173,49 +241,49 @@ def render_tracker_parameters(tracker_cls, tracker_key: str):
         st.info("Questo tracker non espone parametri modificabili.")
         return tracker_kwargs
 
-    st.subheader("Parametri del tracker")
-    st.caption("Modifica i valori dei parametri prima di avviare l'elaborazione.")
+    with st.expander("Parametri del tracker"):
+        st.caption("Modifica i valori dei parametri prima di avviare l'elaborazione.")
 
-    columns = [st.container()] if len(specs) == 1 else st.columns(2)
+        columns = [st.container()] if len(specs) == 1 else st.columns(2)
 
-    for idx, spec in enumerate(specs):
-        container  = columns[idx % len(columns)]
-        name       = spec["name"]
-        label      = spec.get("label", name)
-        default    = spec.get("default")
-        widget_key = f"{tracker_key}__{name}"
-        field_type = spec.get("type", "text")
-        min_value  = spec.get("min")
-        max_value  = spec.get("max")
-        step       = spec.get("step")
+        for idx, spec in enumerate(specs):
+            container  = columns[idx % len(columns)]
+            name       = spec["name"]
+            label      = spec.get("label", name)
+            default    = spec.get("default")
+            widget_key = f"{tracker_key}__{name}"
+            field_type = spec.get("type", "text")
+            min_value  = spec.get("min")
+            max_value  = spec.get("max")
+            step       = spec.get("step")
 
-        if field_type == "int":
-            value = container.number_input(label, min_value=int(min_value) if min_value is not None else None,
-                                           max_value=int(max_value) if max_value is not None else None,
-                                           value=int(default) if default is not None else 0,
-                                           step=int(step) if step is not None else 1, key=widget_key)
-        elif field_type == "float":
-            value = container.number_input(label, min_value=float(min_value) if min_value is not None else None,
-                                           max_value=float(max_value) if max_value is not None else None,
-                                           value=float(default) if default is not None else 0.0,
-                                           step=float(step) if step is not None else 0.01,
-                                           format="%.4f", key=widget_key)
-        elif field_type == "bool":
-            value = container.checkbox(label, value=bool(default), key=widget_key)
-        elif field_type == "select":
-            options = spec.get("options", [])
-            if not options:
-                value = container.text_input(label, value="" if default is None else str(default), key=widget_key)
-                value = value.strip() or None
+            if field_type == "int":
+                value = container.number_input(label, min_value=int(min_value) if min_value is not None else None,
+                                            max_value=int(max_value) if max_value is not None else None,
+                                            value=int(default) if default is not None else 0,
+                                            step=int(step) if step is not None else 1, key=widget_key)
+            elif field_type == "float":
+                value = container.number_input(label, min_value=float(min_value) if min_value is not None else None,
+                                            max_value=float(max_value) if max_value is not None else None,
+                                            value=float(default) if default is not None else 0.0,
+                                            step=float(step) if step is not None else 0.01,
+                                            format="%.4f", key=widget_key)
+            elif field_type == "bool":
+                value = container.checkbox(label, value=bool(default), key=widget_key)
+            elif field_type == "select":
+                options = spec.get("options", [])
+                if not options:
+                    value = container.text_input(label, value="" if default is None else str(default), key=widget_key)
+                    value = value.strip() or None
+                else:
+                    index = options.index(default) if default in options else 0
+                    value = container.selectbox(label, options, index=index, key=widget_key)
             else:
-                index = options.index(default) if default in options else 0
-                value = container.selectbox(label, options, index=index, key=widget_key)
-        else:
-            value = container.text_input(label, value="" if default is None else str(default), key=widget_key,
-                                         help="Lascia vuoto per passare None" if default is None else None)
-            value = value.strip() or None
+                value = container.text_input(label, value="" if default is None else str(default), key=widget_key,
+                                            help="Lascia vuoto per passare None" if default is None else None)
+                value = value.strip() or None
 
-        tracker_kwargs[name] = value
+            tracker_kwargs[name] = value
 
     return tracker_kwargs
 
@@ -275,7 +343,7 @@ if uploaded_file is not None:
 
     st.markdown("---")
 
-    tab1, tab2 = st.tabs(["Tracking Test", "Comparazione Analytics"])
+    tab1, tab2, tab3 = st.tabs(["Tracking Singolo", "Tracker VS Tracker", "Comparazione Analytics"])
 
     # --- TAB 1 ---
     with tab1:
@@ -294,11 +362,9 @@ if uploaded_file is not None:
             if risultati is None:
                 st.stop()
 
-            # Salva video tracciato
             if tracked_bytes:
                 video_tracked_converted.write_bytes(tracked_bytes)
 
-            # Salva CSV con timestamp (compatibile con tab2)
             if csv_bytes:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 csv_path  = video_output_folder / f"{tracker_type.lower()}_{timestamp}.csv"
@@ -317,9 +383,72 @@ if uploaded_file is not None:
                 st.video(str(video_tracked_converted))
             else:
                 st.caption("Avvia l'elaborazione per generare l'output visivo.")
-
+                
     # --- TAB 2 ---
     with tab2:
+        col1, col2 = st.columns(2)
+        with col1:
+            tracker_type_1 = st.selectbox("Seleziona l'algoritmo da applicare:", list(TRACKER_REGISTRY.keys()), key="tracker_type_col1")
+            TrackerClass_1   = TRACKER_REGISTRY[tracker_type_1]
+            tracker_kwargs_1 = render_tracker_parameters(TrackerClass_1, tracker_key=f"{tracker_type_1.lower()}_col1")
+
+            video_tracked_converted_1 = video_output_folder / f"{tracker_type_1.lower()}_col1_h264.mp4"
+
+            if st.button("Avvia Elaborazione", key="btn_col1"):
+                with st.spinner(f"Tracking **{tracker_type_1}** in corso sul server (video + CSV)…"):
+                    risultati, tracked_bytes, csv_bytes = server_track(
+                        video_salvato_path, tracker_type_1, detections_data, tracker_kwargs_1,
+                    )
+
+                if risultati is None:
+                    st.stop()
+
+                if tracked_bytes:
+                    video_tracked_converted_1.write_bytes(tracked_bytes)
+
+                if csv_bytes:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    csv_path  = video_output_folder / f"{tracker_type_1.lower()}_{timestamp}.csv"
+                    csv_path.write_bytes(csv_bytes)
+
+            st.markdown(f"**Video Tracciato ({tracker_type_1} - Box Verdi + ID):**")
+            if video_tracked_converted_1.exists():
+                st.video(str(video_tracked_converted_1))
+            else:
+                st.caption("Avvia l'elaborazione per generare l'output visivo.")
+
+        with col2:
+            tracker_type_2 = st.selectbox("Seleziona l'algoritmo da applicare:", list(TRACKER_REGISTRY.keys()), key="tracker_type_col2")
+            TrackerClass_2   = TRACKER_REGISTRY[tracker_type_2]
+            tracker_kwargs_2 = render_tracker_parameters(TrackerClass_2, tracker_key=f"{tracker_type_2.lower()}_col2")
+
+            video_tracked_converted_2 = video_output_folder / f"{tracker_type_2.lower()}_col2_h264.mp4"
+
+            if st.button("Avvia Elaborazione", key="btn_col2"):
+                with st.spinner(f"Tracking **{tracker_type_2}** in corso sul server (video + CSV)…"):
+                    risultati, tracked_bytes, csv_bytes = server_track(
+                        video_salvato_path, tracker_type_2, detections_data, tracker_kwargs_2,
+                    )
+
+                if risultati is None:
+                    st.stop()
+
+                if tracked_bytes:
+                    video_tracked_converted_2.write_bytes(tracked_bytes)
+
+                if csv_bytes:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    csv_path  = video_output_folder / f"{tracker_type_2.lower()}_{timestamp}.csv"
+                    csv_path.write_bytes(csv_bytes)
+
+            st.markdown(f"**Video Tracciato ({tracker_type_2} - Box Verdi + ID):**")
+            if video_tracked_converted_2.exists():
+                st.video(str(video_tracked_converted_2))
+            else:
+                st.caption("Avvia l'elaborazione per generare l'output visivo.")
+
+    # --- TAB 3 ---
+    with tab3:
         st.subheader("Analisi Performance dei Tracker Elaborati")
 
         metriche_globali = {}
@@ -329,6 +458,15 @@ if uploaded_file is not None:
                 metriche = calcola_metriche_csv(csv_files[-1])
                 if metriche:
                     metriche_globali[nome_tracker.upper()] = metriche
+
+        # Ground Truth — aggiunta solo se il file è stato caricato
+        if gt_file is not None:
+            gt_file.seek(0)
+            gt_df = parse_gt_file(gt_file)
+            if gt_df is not None:
+                metriche_globali["GROUND TRUTH"] = calcola_metriche_gt(gt_df)
+            else:
+                st.warning("Impossibile parsificare il file ground truth. Controlla il formato (MOT: frame,track_id,x,y,w,h,…).")
 
         if metriche_globali:
             df_comparativo = pd.DataFrame.from_dict(metriche_globali, orient="index")
