@@ -2,6 +2,7 @@ import io
 import base64
 import zipfile
 import json
+import csv as _csv
 from pathlib import Path
 from datetime import datetime
 
@@ -12,6 +13,7 @@ import streamlit as st
 
 from custom_trackers import TRACKER_REGISTRY
 from evaluator import TrackerEvaluator
+from visualization import CLASS_COLOR_PALETTE
 
 st.set_page_config(page_title="Dashboard Comparazione Video", layout="wide")
 st.title("Comparazione BBox Grezze vs Video Tracciato")
@@ -22,6 +24,17 @@ UPLOAD_DIR = Path("uploaded_videos")
 OUTPUT_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+if "detections_data" not in st.session_state:
+    st.session_state["detections_data"] = None
+if "detections_video_key" not in st.session_state:
+    st.session_state["detections_video_key"] = None
+
+# Classi YOLO comuni — l'utente può aggiungerne altre via text_input
+DEFAULT_YOLO_CLASSES = [
+    "person", "car", "truck", "bus", "motorcycle", "bicycle",
+    "dog", "cat", "bird", "boat", "aeroplane", "train",
+]
+
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -29,8 +42,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 with st.sidebar:
     st.header("Configurazione Server")
     SERVER_URL = st.text_input(
-        "URL del server",
-        value="http://localhost:8000",
+        "URL del server", value="http://localhost:8000",
         help="Indirizzo base del server FastAPI",
     ).rstrip("/")
 
@@ -59,6 +71,27 @@ with st.sidebar:
     }
 
     st.markdown("---")
+    st.header("Classi da rilevare")
+    selected_classes = st.multiselect(
+        "Seleziona le classi target:",
+        options=DEFAULT_YOLO_CLASSES,
+        default=["car"],
+        help="YOLO rileverà solo queste classi",
+    )
+    extra_classes = st.text_input(
+        "Aggiungi classi custom (virgola-separate):", value=""
+    ).strip()
+    if extra_classes:
+        for c in extra_classes.split(","):
+            c = c.strip()
+            if c and c not in selected_classes:
+                selected_classes.append(c)
+
+    if not selected_classes:
+        st.warning("Seleziona almeno una classe.")
+        selected_classes = ["car"]
+
+    st.markdown("---")
     st.header("Ground Truth (opzionale)")
     gt_file = st.file_uploader(
         "Carica file ground truth (.txt, formato MOT):",
@@ -66,19 +99,21 @@ with st.sidebar:
         help="Formato atteso: frame, track_id, x, y, w, h, conf, class, visibility",
     )
 
-
 # ---------------------------------------------------------------------------
 # Chiamate server
 # ---------------------------------------------------------------------------
 
-def server_detect(video_path: Path, model_name: str, yolo_params: dict):
-    """Ritorna (detections, video_bytes_or_None)."""
+def server_detect(video_path: Path, model_name: str, yolo_params: dict, target_classes: list):
     endpoint = f"{SERVER_URL}/api/detect"
     try:
         with open(video_path, "rb") as vf:
             resp = requests.post(
                 endpoint,
-                data={"model_name": model_name, "yolo_params_json": json.dumps(yolo_params)},
+                data={
+                    "model_name":          model_name,
+                    "yolo_params_json":    json.dumps(yolo_params),
+                    "target_classes_json": json.dumps(target_classes),
+                },
                 files={"video": (video_path.name, vf, "video/mp4")},
                 timeout=600,
                 proxies={"http": None, "https": None},
@@ -90,13 +125,11 @@ def server_detect(video_path: Path, model_name: str, yolo_params: dict):
                 detail = resp.text
             st.error(f"Errore `/api/detect` [{resp.status_code}]:\n```\n{detail[:1000]}\n```")
             return None, None
-
         data        = resp.json()
         detections  = data.get("detections")
         yolo_b64    = data.get("yolo_video")
         video_bytes = base64.b64decode(yolo_b64) if yolo_b64 else None
         return detections, video_bytes
-
     except requests.exceptions.ConnectionError:
         st.error(f"Impossibile connettersi al server: `{endpoint}`")
         return None, None
@@ -105,8 +138,8 @@ def server_detect(video_path: Path, model_name: str, yolo_params: dict):
         return None, None
 
 
-def server_track(video_path: Path, tracker_name: str, detections_data: list, tracker_params: dict):
-    """Ritorna (tracking_results_list, video_bytes, csv_bytes) oppure (None, None, None)."""
+def server_track(video_path: Path, tracker_name: str, detections_data: list,
+                 tracker_params: dict, target_class: str = ""):
     endpoint = f"{SERVER_URL}/api/track"
     try:
         with open(video_path, "rb") as vf:
@@ -116,12 +149,12 @@ def server_track(video_path: Path, tracker_name: str, detections_data: list, tra
                     "tracker_name":        tracker_name,
                     "detections_json":     json.dumps(detections_data),
                     "tracker_params_json": json.dumps(tracker_params),
+                    "target_class":        target_class,
                 },
                 files={"video": (video_path.name, vf, "video/mp4")},
                 timeout=600,
                 proxies={"http": None, "https": None},
             )
-
         if resp.status_code != 200:
             try:
                 detail = resp.json().get("detail", resp.text)
@@ -129,28 +162,20 @@ def server_track(video_path: Path, tracker_name: str, detections_data: list, tra
                 detail = resp.text
             st.error(f"Errore `/api/track` [{resp.status_code}]:\n```\n{detail[:1000]}\n```")
             return None, None, None
-
-        # Risposta è uno zip
-        zf        = zipfile.ZipFile(io.BytesIO(resp.content))
-        names     = zf.namelist()
-        mp4_name  = next((n for n in names if n.endswith(".mp4")), None)
-        csv_name  = next((n for n in names if n.endswith(".csv")), None)
+        zf          = zipfile.ZipFile(io.BytesIO(resp.content))
+        names       = zf.namelist()
+        mp4_name    = next((n for n in names if n.endswith(".mp4")), None)
+        csv_name    = next((n for n in names if n.endswith(".csv")), None)
         video_bytes = zf.read(mp4_name) if mp4_name else None
         csv_bytes   = zf.read(csv_name) if csv_name else None
-
-        # Parsing CSV → lista risultati (per compatibilità con tab2)
         results = []
         if csv_bytes:
-            import csv as _csv
             reader = _csv.DictReader(
-                line for line in csv_bytes.decode().splitlines()
-                if not line.startswith("#")
+                line for line in csv_bytes.decode().splitlines() if not line.startswith("#")
             )
             for row in reader:
                 results.append({k: (int(v) if k in ("frame", "track_id") else float(v)) for k, v in row.items()})
-
         return results, video_bytes, csv_bytes
-
     except requests.exceptions.ConnectionError:
         st.error(f"Impossibile connettersi al server: `{endpoint}`")
         return None, None, None
@@ -159,8 +184,48 @@ def server_track(video_path: Path, tracker_name: str, detections_data: list, tra
         return None, None, None
 
 
+def server_track_multi(video_path: Path, assignments: list, detections_data: list):
+    """
+    assignments: lista di {"tracker_name", "target_class", "tracker_params"}
+    Ritorna (video_bytes, dict{label -> csv_bytes}) oppure (None, None)
+    """
+    endpoint = f"{SERVER_URL}/api/track_multi"
+    try:
+        with open(video_path, "rb") as vf:
+            resp = requests.post(
+                endpoint,
+                data={
+                    "assignments_json": json.dumps(assignments),
+                    "detections_json":  json.dumps(detections_data),
+                },
+                files={"video": (video_path.name, vf, "video/mp4")},
+                timeout=600,
+                proxies={"http": None, "https": None},
+            )
+        if resp.status_code != 200:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            st.error(f"Errore `/api/track_multi` [{resp.status_code}]:\n```\n{detail[:1000]}\n```")
+            return None, None
+        zf        = zipfile.ZipFile(io.BytesIO(resp.content))
+        names     = zf.namelist()
+        mp4_name  = next((n for n in names if n.endswith(".mp4")), None)
+        csv_names = [n for n in names if n.endswith(".csv")]
+        video_bytes = zf.read(mp4_name) if mp4_name else None
+        csv_map = {n.replace("_tracking.csv", ""): zf.read(n) for n in csv_names}
+        return video_bytes, csv_map
+    except requests.exceptions.ConnectionError:
+        st.error(f"Impossibile connettersi al server: `{endpoint}`")
+        return None, None
+    except Exception as e:
+        st.error(f"Errore `/api/track_multi`:\n```\n{e}\n```")
+        return None, None
+
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (invariati)
 # ---------------------------------------------------------------------------
 
 def calcola_metriche_csv(csv_path: Path):
@@ -174,10 +239,6 @@ def calcola_metriche_csv(csv_path: Path):
 
 
 def parse_gt_file(gt_file_obj) -> pd.DataFrame | None:
-    """Parsifica un file ground truth in formato MOT e ritorna un DataFrame.
-    Colonne attese: frame, track_id, x, y, w, h, conf, class, visibility.
-    Righe con track_id == -1 (oggetti ignorati) vengono escluse.
-    """
     try:
         content = gt_file_obj.read().decode("utf-8")
         rows = []
@@ -194,58 +255,40 @@ def parse_gt_file(gt_file_obj) -> pd.DataFrame | None:
                 continue
             x, y, w, h = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
             rows.append({"frame": frame_id, "track_id": track_id, "x": x, "y": y, "w": w, "h": h})
-        if not rows:
-            return None
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows) if rows else None
     except Exception:
         return None
 
 
 def calcola_metriche_gt(gt_df: pd.DataFrame) -> dict:
-    """Calcola metriche di base direttamente dal DataFrame ground truth."""
-    total_frames = int(gt_df["frame"].max()) + 1
+    total_frames  = int(gt_df["frame"].max()) + 1
     unique_tracks = gt_df["track_id"].nunique()
     track_lengths = gt_df.groupby("track_id")["frame"].count()
-    avg_len = float(track_lengths.mean())
-    max_len = int(track_lengths.max())
-    total_det = len(gt_df)
-    avg_lifetime = float(
-        gt_df.groupby("track_id").apply(lambda g: g["frame"].max() - g["frame"].min() + 1).mean()
-    )
-    max_lifetime = int(
-        gt_df.groupby("track_id").apply(lambda g: g["frame"].max() - g["frame"].min() + 1).max()
-    )
+    avg_len       = float(track_lengths.mean())
+    max_len       = int(track_lengths.max())
+    total_det     = len(gt_df)
+    avg_lifetime  = float(gt_df.groupby("track_id").apply(lambda g: g["frame"].max() - g["frame"].min() + 1).mean())
+    max_lifetime  = int(gt_df.groupby("track_id").apply(lambda g: g["frame"].max() - g["frame"].min() + 1).max())
     track_coverage = (total_det / (unique_tracks * total_frames) * 100) if unique_tracks > 0 else 0.0
     return {
-        "num_tracks": unique_tracks,
-        "total_detections": total_det,
-        "avg_track_length": round(avg_len, 2),
-        "max_track_length": max_len,
-        "avg_id_lifetime": round(avg_lifetime, 2),
-        "max_id_lifetime": max_lifetime,
+        "num_tracks": unique_tracks, "total_detections": total_det,
+        "avg_track_length": round(avg_len, 2), "max_track_length": max_len,
+        "avg_id_lifetime": round(avg_lifetime, 2), "max_id_lifetime": max_lifetime,
         "track_coverage": round(track_coverage, 4),
-        # GT non ha ID switches, fragmentation, ecc. — riempiamo con NaN
-        "id_switches": float("nan"),
-        "fragmentation": float("nan"),
-        "kinematic_jumps": float("nan"),
-        "spurious_tracks_ratio": float("nan"),
-        "time": float("nan"),
+        "id_switches": float("nan"), "fragmentation": float("nan"),
+        "kinematic_jumps": float("nan"), "spurious_tracks_ratio": float("nan"), "time": float("nan"),
     }
 
 
 def render_tracker_parameters(tracker_cls, tracker_key: str):
     specs          = getattr(tracker_cls, "PARAMETER_SPECS", [])
     tracker_kwargs = {}
-
     if not specs:
         st.info("Questo tracker non espone parametri modificabili.")
         return tracker_kwargs
-
     with st.expander("Parametri del tracker"):
         st.caption("Modifica i valori dei parametri prima di avviare l'elaborazione.")
-
         columns = [st.container()] if len(specs) == 1 else st.columns(2)
-
         for idx, spec in enumerate(specs):
             container  = columns[idx % len(columns)]
             name       = spec["name"]
@@ -256,18 +299,17 @@ def render_tracker_parameters(tracker_cls, tracker_key: str):
             min_value  = spec.get("min")
             max_value  = spec.get("max")
             step       = spec.get("step")
-
             if field_type == "int":
                 value = container.number_input(label, min_value=int(min_value) if min_value is not None else None,
-                                            max_value=int(max_value) if max_value is not None else None,
-                                            value=int(default) if default is not None else 0,
-                                            step=int(step) if step is not None else 1, key=widget_key)
+                                               max_value=int(max_value) if max_value is not None else None,
+                                               value=int(default) if default is not None else 0,
+                                               step=int(step) if step is not None else 1, key=widget_key)
             elif field_type == "float":
                 value = container.number_input(label, min_value=float(min_value) if min_value is not None else None,
-                                            max_value=float(max_value) if max_value is not None else None,
-                                            value=float(default) if default is not None else 0.0,
-                                            step=float(step) if step is not None else 0.01,
-                                            format="%.4f", key=widget_key)
+                                               max_value=float(max_value) if max_value is not None else None,
+                                               value=float(default) if default is not None else 0.0,
+                                               step=float(step) if step is not None else 0.01,
+                                               format="%.4f", key=widget_key)
             elif field_type == "bool":
                 value = container.checkbox(label, value=bool(default), key=widget_key)
             elif field_type == "select":
@@ -280,11 +322,9 @@ def render_tracker_parameters(tracker_cls, tracker_key: str):
                     value = container.selectbox(label, options, index=index, key=widget_key)
             else:
                 value = container.text_input(label, value="" if default is None else str(default), key=widget_key,
-                                            help="Lascia vuoto per passare None" if default is None else None)
+                                             help="Lascia vuoto per passare None" if default is None else None)
                 value = value.strip() or None
-
             tracker_kwargs[name] = value
-
     return tracker_kwargs
 
 
@@ -294,219 +334,351 @@ def render_tracker_parameters(tracker_cls, tracker_key: str):
 uploaded_file = st.file_uploader("Carica un file video (.mp4):", type=["mp4"])
 
 if uploaded_file is not None:
-    peso           = uploaded_file.size
-    video_stem     = Path(uploaded_file.name).stem
-    nuovo_nome     = f"{video_stem}_{peso}.mp4"
+    peso               = uploaded_file.size
+    video_stem         = Path(uploaded_file.name).stem
+    nuovo_nome         = f"{video_stem}_{peso}.mp4"
     video_salvato_path = UPLOAD_DIR / nuovo_nome
 
     with open(video_salvato_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
     model_slug          = model_name.replace(".pt", "").replace("/", "_").replace("\\", "_")
-    video_output_folder = OUTPUT_DIR / f"{video_salvato_path.stem}__{model_slug}"
+    classes_slug        = "_".join(sorted(selected_classes))
+    video_output_folder = OUTPUT_DIR / f"{video_salvato_path.stem}__{model_slug}__{classes_slug}"
     video_output_folder.mkdir(parents=True, exist_ok=True)
 
     detections_json_path = video_output_folder / "detections.json"
     yolo_video_path      = video_output_folder / "raw_detections_h264.mp4"
 
-    # --- Detection (con cache) ---
-    if not detections_json_path.exists():
-        with st.spinner(f"Detection in corso sul server con **{model_name}**…"):
-            detections_data, yolo_video_bytes = server_detect(video_salvato_path, model_name, yolo_params)
-        if detections_data is None:
-            st.stop()
+    # --- Detection ---
+    detection_key = f"{video_salvato_path.stem}__{model_slug}__{classes_slug}"
 
-        with open(detections_json_path, "w") as f:
-            json.dump(detections_data, f, indent=4)
+    # Avvisa se i parametri sono cambiati rispetto all'ultima detection eseguita
+    warning_placeholder = st.empty()
+    if (st.session_state["detections_data"] is not None
+            and st.session_state["detections_video_key"] != detection_key):
+        warning_placeholder.warning(
+            "Video, modello o classi sono cambiati rispetto all'ultima detection. "
+            "Premi **Avvia Detection** per aggiornare."
+        )
+ 
+    if st.button("Avvia Detection", key="btn_det"):
+        if not detections_json_path.exists():
+            with st.spinner(f"Detection in corso con **{model_name}** per classi: {selected_classes}…"):
+                det_result, yolo_video_bytes = server_detect(
+                    video_salvato_path, model_name, yolo_params, selected_classes
+                )
+            if det_result is None:
+                st.stop()
+            with open(detections_json_path, "w") as f:
+                json.dump(det_result, f, indent=4)
+            if yolo_video_bytes and not yolo_video_path.exists():
+                yolo_video_path.write_bytes(yolo_video_bytes)
+        else:
+            with open(detections_json_path, "r") as f:
+                det_result = json.load(f)
+ 
+        st.session_state["detections_data"]      = det_result
+        st.session_state["detections_video_key"] = detection_key
+        warning_placeholder.empty()
 
-        if yolo_video_bytes and not yolo_video_path.exists():
-            yolo_video_path.write_bytes(yolo_video_bytes)
+    # Legge da session_state: persiste tra re-run senza rieseguire la detection
+    detections_data = st.session_state["detections_data"]
 
-    with open(detections_json_path, "r") as f:
-        detections_data = json.load(f)
-
-    # --- Info video ---
-    col_video_or, col_video_dett = st.columns(2)
-    with col_video_or:
-        st.video(str(video_salvato_path))
-    with col_video_dett:
-        cap = cv2.VideoCapture(str(video_salvato_path))
-        fps    = cap.get(cv2.CAP_PROP_FPS)
-        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        total_detections = sum(len(f["detections"]) for f in detections_data)
-        st.metric("Durata video",    f"{(frames / fps):.2f} s")
-        st.metric("Frame Rate",      f"{fps:.2f} FPS")
-        st.metric("Frame Totali",    f"{frames} frames")
-        st.metric("Dimensioni",      f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}X{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} px")
-        st.metric("Detections totali", str(total_detections))
-        cap.release()
+    # Info video + conteggio classi (visibile solo se detection disponibile)
+    if detections_data is not None:
+        col_video_or, col_video_dett = st.columns(2)
+        with col_video_or:
+            st.video(str(video_salvato_path))
+        with col_video_dett:
+            cap    = cv2.VideoCapture(str(video_salvato_path))
+            fps    = cap.get(cv2.CAP_PROP_FPS)
+            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            st.metric("Durata video",  f"{(frames / fps):.2f} s")
+            st.metric("Frame Rate",    f"{fps:.2f} FPS")
+            st.metric("Frame Totali",  f"{frames} frames")
+            st.metric("Dimensioni",    f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} px")
+            cap.release()
+            class_counts = {}
+            for frame in detections_data:
+                for det in frame["detections"]:
+                    cls = det[5] if len(det) >= 6 else "?"
+                    class_counts[cls] = class_counts.get(cls, 0) + 1
+            if class_counts:
+                st.markdown("**Detections per classe:**")
+                for cls, cnt in class_counts.items():
+                    st.markdown(f"- **{cls}**: {cnt}")
 
     st.markdown("---")
 
-    tab1, tab2, tab3 = st.tabs(["Tracking Singolo", "Tracker VS Tracker", "Comparazione Analytics"])
+    if detections_data is None:
+        st.info("Premi **Avvia Detection** per caricare le detection prima di usare i tracker.")
+        st.stop()
 
-    # --- TAB 1 ---
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Tracking Singolo",
+        "Multi-Classe (un tracker per classe)",
+        "Tracker VS Tracker",
+        "Comparazione Analytics",
+    ])
+
+    # -----------------------------------------------------------------------
+    # TAB 1 — Tracking singolo (una sola classe)
+    # -----------------------------------------------------------------------
     with tab1:
-        tracker_type = st.selectbox("Seleziona l'algoritmo da applicare:", list(TRACKER_REGISTRY.keys()))
+        col_cls, col_trk = st.columns(2)
+        with col_cls:
+            single_class = st.selectbox(
+                "Classe da tracciare:", selected_classes, key="tab1_class"
+            )
+        with col_trk:
+            tracker_type = st.selectbox(
+                "Algoritmo:", list(TRACKER_REGISTRY.keys()), key="tab1_tracker"
+            )
+
         TrackerClass   = TRACKER_REGISTRY[tracker_type]
-        tracker_kwargs = render_tracker_parameters(TrackerClass, tracker_key=tracker_type.lower())
+        tracker_kwargs = render_tracker_parameters(TrackerClass, tracker_key=f"tab1_{tracker_type}")
 
-        video_tracked_converted = video_output_folder / f"{tracker_type.lower()}_h264.mp4"
+        video_tracked_converted = video_output_folder / f"{tracker_type.lower()}_{single_class}_h264.mp4"
 
-        if st.button("Avvia Elaborazione"):
-            with st.spinner(f"Tracking **{tracker_type}** in corso sul server (video + CSV)…"):
+        if st.button("Avvia Elaborazione", key="btn_tab1"):
+            with st.spinner(f"Tracking **{tracker_type}** su **{single_class}**…"):
                 risultati, tracked_bytes, csv_bytes = server_track(
-                    video_salvato_path, tracker_type, detections_data, tracker_kwargs,
+                    video_salvato_path, tracker_type, detections_data,
+                    tracker_kwargs, target_class=single_class,
                 )
-
             if risultati is None:
                 st.stop()
-
             if tracked_bytes:
                 video_tracked_converted.write_bytes(tracked_bytes)
-
             if csv_bytes:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                csv_path  = video_output_folder / f"{tracker_type.lower()}_{timestamp}.csv"
+                csv_path  = video_output_folder / f"{tracker_type.lower()}_{single_class}_{timestamp}.csv"
                 csv_path.write_bytes(csv_bytes)
 
         v_col1, v_col2 = st.columns(2)
         with v_col1:
-            st.markdown("**Rilevamenti Grezzi (YOLO - Box Blu):**")
+            st.markdown("**Rilevamenti Grezzi (YOLO):**")
             if yolo_video_path.exists():
                 st.video(str(yolo_video_path))
             else:
                 st.caption("Avvia l'elaborazione per generare l'output visivo.")
         with v_col2:
-            st.markdown(f"**Video Tracciato ({tracker_type} - Box Verdi + ID):**")
+            st.markdown(f"**Video Tracciato ({tracker_type} — {single_class}):**")
             if video_tracked_converted.exists():
                 st.video(str(video_tracked_converted))
             else:
                 st.caption("Avvia l'elaborazione per generare l'output visivo.")
-                
-    # --- TAB 2 ---
+
+    # -----------------------------------------------------------------------
+    # TAB 2 — Multi-classe: un tracker per ogni classe → video unico
+    # -----------------------------------------------------------------------
     with tab2:
-        col1, col2 = st.columns(2)
-        with col1:
-            tracker_type_1 = st.selectbox("Seleziona l'algoritmo da applicare:", list(TRACKER_REGISTRY.keys()), key="tracker_type_col1")
-            TrackerClass_1   = TRACKER_REGISTRY[tracker_type_1]
-            tracker_kwargs_1 = render_tracker_parameters(TrackerClass_1, tracker_key=f"{tracker_type_1.lower()}_col1")
+        st.subheader("Assegna un tracker a ogni classe rilevata")
+        st.markdown(
+            "Ogni classe viene tracciata con il proprio algoritmo. "
+            "Il risultato è un unico video con colori diversi per classe."
+        )
 
-            video_tracked_converted_1 = video_output_folder / f"{tracker_type_1.lower()}_col1_h264.mp4"
+        assignments_ui = []
+        for idx, cls in enumerate(selected_classes):
+            color_bgr = CLASS_COLOR_PALETTE[idx % len(CLASS_COLOR_PALETTE)]
+            col_trk, col_params = st.columns(2)
+            with col_trk:
+                trk = st.selectbox(
+                    f"Tracker per **{cls}**:",
+                    list(TRACKER_REGISTRY.keys()),
+                    key=f"multi_tracker_{cls}",
+                )
+            with col_params:
+                TrackerCls = TRACKER_REGISTRY[trk]
+                kwargs     = render_tracker_parameters(TrackerCls, tracker_key=f"multi_{cls}_{trk}")
+            assignments_ui.append({
+                "tracker_name":   trk,
+                "target_class":   cls,
+                "tracker_params": kwargs,
+            })
 
-            if st.button("Avvia Elaborazione", key="btn_col1"):
-                with st.spinner(f"Tracking **{tracker_type_1}** in corso sul server (video + CSV)…"):
-                    risultati, tracked_bytes, csv_bytes = server_track(
-                        video_salvato_path, tracker_type_1, detections_data, tracker_kwargs_1,
-                    )
+        multi_video_path = video_output_folder / "multi_class_tracked_h264.mp4"
 
-                if risultati is None:
-                    st.stop()
-
-                if tracked_bytes:
-                    video_tracked_converted_1.write_bytes(tracked_bytes)
-
-                if csv_bytes:
+        if st.button("Avvia Multi-Tracking", key="btn_tab2"):
+            with st.spinner("Multi-tracking in corso sul server…"):
+                video_bytes, csv_map = server_track_multi(
+                    video_salvato_path, assignments_ui, detections_data
+                )
+            if video_bytes is None:
+                st.stop()
+            multi_video_path.write_bytes(video_bytes)
+            if csv_map:
+                # csv_map keys dal server: "{target_class}_{tracker_name.lower()}"
+                for name, data in csv_map.items():
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    csv_path  = video_output_folder / f"{tracker_type_1.lower()}_{timestamp}.csv"
-                    csv_path.write_bytes(csv_bytes)
+                    parts     = name.split("_", 1)   # es. "car_deepsort" -> ["car","deepsort"]
+                    cls_part  = parts[0] if len(parts) > 1 else name
+                    trk_part  = parts[1] if len(parts) > 1 else "unknown"
+                    p = video_output_folder / f"{trk_part}_{cls_part}_{timestamp}.csv"
+                    p.write_bytes(data)
 
-            st.markdown(f"**Video Tracciato ({tracker_type_1} - Box Verdi + ID):**")
-            if video_tracked_converted_1.exists():
-                st.video(str(video_tracked_converted_1))
-            else:
-                st.caption("Avvia l'elaborazione per generare l'output visivo.")
+        if multi_video_path.exists():
+            st.markdown("**Video Multi-Classe:**")
+            st.video(str(multi_video_path))
+        else:
+            st.caption("Avvia il Multi-Tracking per generare il video.")
 
-        with col2:
-            tracker_type_2 = st.selectbox("Seleziona l'algoritmo da applicare:", list(TRACKER_REGISTRY.keys()), key="tracker_type_col2")
-            TrackerClass_2   = TRACKER_REGISTRY[tracker_type_2]
-            tracker_kwargs_2 = render_tracker_parameters(TrackerClass_2, tracker_key=f"{tracker_type_2.lower()}_col2")
-
-            video_tracked_converted_2 = video_output_folder / f"{tracker_type_2.lower()}_col2_h264.mp4"
-
-            if st.button("Avvia Elaborazione", key="btn_col2"):
-                with st.spinner(f"Tracking **{tracker_type_2}** in corso sul server (video + CSV)…"):
-                    risultati, tracked_bytes, csv_bytes = server_track(
-                        video_salvato_path, tracker_type_2, detections_data, tracker_kwargs_2,
-                    )
-
-                if risultati is None:
-                    st.stop()
-
-                if tracked_bytes:
-                    video_tracked_converted_2.write_bytes(tracked_bytes)
-
-                if csv_bytes:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    csv_path  = video_output_folder / f"{tracker_type_2.lower()}_{timestamp}.csv"
-                    csv_path.write_bytes(csv_bytes)
-
-            st.markdown(f"**Video Tracciato ({tracker_type_2} - Box Verdi + ID):**")
-            if video_tracked_converted_2.exists():
-                st.video(str(video_tracked_converted_2))
-            else:
-                st.caption("Avvia l'elaborazione per generare l'output visivo.")
-
-    # --- TAB 3 ---
+    # -----------------------------------------------------------------------
+    # TAB 3 — Tracker VS Tracker (su una stessa classe)
+    # -----------------------------------------------------------------------
     with tab3:
+        vs_class = st.selectbox("Classe per il confronto:", selected_classes, key="tab3_class")
+
+        col1, col2 = st.columns(2)
+        for col, suffix in [(col1, "col1"), (col2, "col2")]:
+            with col:
+                trk_type = st.selectbox(
+                    "Algoritmo:", list(TRACKER_REGISTRY.keys()), key=f"tracker_type_{suffix}"
+                )
+                TrackerCls_  = TRACKER_REGISTRY[trk_type]
+                trk_kwargs_  = render_tracker_parameters(TrackerCls_, tracker_key=f"{trk_type.lower()}_{suffix}")
+                video_out_   = video_output_folder / f"{trk_type.lower()}_{vs_class}_{suffix}_h264.mp4"
+
+                if st.button("Avvia Elaborazione", key=f"btn_{suffix}"):
+                    with st.spinner(f"Tracking **{trk_type}** su **{vs_class}**…"):
+                        risultati, tracked_bytes, csv_bytes = server_track(
+                            video_salvato_path, trk_type, detections_data,
+                            trk_kwargs_, target_class=vs_class,
+                        )
+                    if risultati is None:
+                        st.stop()
+                    if tracked_bytes:
+                        video_out_.write_bytes(tracked_bytes)
+                    if csv_bytes:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        p = video_output_folder / f"{trk_type.lower()}_{vs_class}_{timestamp}.csv"
+                        p.write_bytes(csv_bytes)
+
+                st.markdown(f"**Video Tracciato ({trk_type} — {vs_class}):**")
+                if video_out_.exists():
+                    st.video(str(video_out_))
+                else:
+                    st.caption("Avvia l'elaborazione per generare l'output visivo.")
+
+    # -----------------------------------------------------------------------
+    # TAB 4 — Analytics
+    # -----------------------------------------------------------------------
+    with tab4:
         st.subheader("Analisi Performance dei Tracker Elaborati")
-
+ 
         metriche_globali = {}
-        for nome_tracker in TRACKER_REGISTRY.keys():
-            csv_files = sorted(video_output_folder.glob(f"{nome_tracker.lower()}_*.csv"))
-            if csv_files:
-                metriche = calcola_metriche_csv(csv_files[-1])
-                if metriche:
-                    metriche_globali[nome_tracker.upper()] = metriche
-
-        # Ground Truth — aggiunta solo se il file è stato caricato
+ 
+        all_csvs = sorted(video_output_folder.glob("*.csv"))
+        tracker_names_lower = {t.lower(): t for t in TRACKER_REGISTRY.keys()}
+        best_csv = {}
+ 
+        for csv_path in all_csvs:
+            stem      = csv_path.stem
+            matched_trk = None
+            matched_cls = None
+            for trk_lower, trk_display in tracker_names_lower.items():
+                trk_flat  = trk_lower.replace("-", "").replace(" ", "")
+                stem_flat = stem.replace("-", "").replace(" ", "")
+                if stem_flat.startswith(trk_flat):
+                    remainder = stem[len(trk_lower):].lstrip("_")
+                    for cls in selected_classes:
+                        if remainder.startswith(cls + "_") or remainder == cls:
+                            matched_trk = trk_display
+                            matched_cls = cls
+                            break
+                if matched_trk:
+                    break
+            if matched_trk and matched_cls:
+                key = (matched_trk, matched_cls)
+                if key not in best_csv or csv_path.name > best_csv[key].name:
+                    best_csv[key] = csv_path
+ 
+        for (trk_display, cls), csv_path in best_csv.items():
+            metriche = calcola_metriche_csv(csv_path)
+            if metriche:
+                metriche_globali[f"{trk_display.upper()} [{cls}]"] = metriche
+ 
         if gt_file is not None:
             gt_file.seek(0)
             gt_df = parse_gt_file(gt_file)
             if gt_df is not None:
                 metriche_globali["GROUND TRUTH"] = calcola_metriche_gt(gt_df)
             else:
-                st.warning("Impossibile parsificare il file ground truth. Controlla il formato (MOT: frame,track_id,x,y,w,h,…).")
-
+                st.warning("Impossibile parsificare il file ground truth.")
+ 
         if metriche_globali:
             df_comparativo = pd.DataFrame.from_dict(metriche_globali, orient="index")
-
             st.markdown("##### Tabella Riassuntiva")
             st.dataframe(df_comparativo)
-
+ 
             st.markdown("---")
-            st.markdown("##### Grafici Comparativi delle Metriche")
-
+            st.markdown("##### Grafici Comparativi")
+ 
             mappa_nomi_metriche = {
                 "id_switches": "ID Switches", "fragmentation": "Fragmentation",
                 "kinematic_jumps": "Kinematic Jumps", "track_coverage": "Track Coverage %",
-                "time": "Tempo di Elaborazione in secondi",
-                "avg_track_length": "Lunghezza Media Tracce in frame",
-                "max_track_length": "Lunghezza Massima Tracce in frame",
-                "num_tracks": "Numero di Tracce Uniche Rilevate",
-                "avg_id_lifetime": "Durata Vita Media ID in frame",
-                "max_id_lifetime": "Durata Vita Massima ID in frame",
+                "time": "Tempo di Elaborazione (s)",
+                "avg_track_length": "Lunghezza Media Tracce (frame)",
+                "max_track_length": "Lunghezza Massima Tracce (frame)",
+                "num_tracks": "Numero di Tracce Uniche",
+                "avg_id_lifetime": "Durata Vita Media ID (frame)",
+                "max_id_lifetime": "Durata Vita Massima ID (frame)",
                 "total_detections": "Rilevamenti Totali Tracciati",
                 "spurious_tracks_ratio": "Rapporto Tracce Spurie",
             }
-            lista_colori = [
-                "#06b6d4","#ea580c","#7c3aed","#10b981","#e11d48",
-                "#2563eb","#d946ef","#84cc16","#f59e0b","#4f46e5",
-                "#f43f5e","#34A853",
-            ]
-            colonne_disponibili = list(df_comparativo.columns)
-            for i in range(0, len(colonne_disponibili), 2):
-                c1, c2  = st.columns(2)
-                col_1   = colonne_disponibili[i]
-                label_1 = mappa_nomi_metriche.get(col_1, col_1.replace("_", " ").title())
-                with c1:
-                    st.markdown(f"##### {label_1}")
-                    st.bar_chart(df_comparativo[col_1], color=lista_colori[i % len(lista_colori)], height=450)
-                if i + 1 < len(colonne_disponibili):
-                    col_2   = colonne_disponibili[i + 1]
-                    label_2 = mappa_nomi_metriche.get(col_2, col_2.replace("_", " ").title())
-                    with c2:
-                        st.markdown(f"##### {label_2}")
-                        st.bar_chart(df_comparativo[col_2], color=lista_colori[(i+1) % len(lista_colori)], height=450)
+ 
+            # --- Filtri classe e tracker ---
+            classi_disponibili  = sorted({k.split("[")[1].rstrip("]") for k in metriche_globali if "[" in k})
+            tracker_disponibili = sorted({k.split(" [")[0] for k in metriche_globali if "[" in k})
+            if "GROUND TRUTH" in metriche_globali:
+                tracker_disponibili.append("GROUND TRUTH")
+ 
+            f_col1, f_col2 = st.columns(2)
+            with f_col1:
+                classi_scelte = st.multiselect(
+                    "Filtra per classe:", options=classi_disponibili,
+                    default=classi_disponibili, key="tab4_filter_class",
+                )
+            with f_col2:
+                tracker_scelti = st.multiselect(
+                    "Filtra per tracker:", options=tracker_disponibili,
+                    default=tracker_disponibili, key="tab4_filter_tracker",
+                )
+ 
+            righe_filtrate = []
+            for k in metriche_globali:
+                if k == "GROUND TRUTH":
+                    if "GROUND TRUTH" in tracker_scelti:
+                        righe_filtrate.append(k)
+                else:
+                    trk = k.split(" [")[0]
+                    cls = k.split("[")[1].rstrip("]")
+                    if trk in tracker_scelti and cls in classi_scelte:
+                        righe_filtrate.append(k)
+ 
+            if not righe_filtrate:
+                st.info("Nessun risultato con i filtri selezionati.")
+            else:
+                df_filtrato = df_comparativo.loc[righe_filtrate]
+                lista_colori = [
+                    "#06b6d4","#ea580c","#7c3aed","#10b981","#e11d48",
+                    "#2563eb","#d946ef","#84cc16","#f59e0b","#4f46e5",
+                ]
+                colonne_disponibili = list(df_filtrato.columns)
+                for i in range(0, len(colonne_disponibili), 2):
+                    c1, c2  = st.columns(2)
+                    col_1   = colonne_disponibili[i]
+                    label_1 = mappa_nomi_metriche.get(col_1, col_1.replace("_", " ").title())
+                    with c1:
+                        st.markdown(f"##### {label_1}")
+                        st.bar_chart(df_filtrato[col_1], color=lista_colori[i % len(lista_colori)], height=450)
+                    if i + 1 < len(colonne_disponibili):
+                        col_2   = colonne_disponibili[i + 1]
+                        label_2 = mappa_nomi_metriche.get(col_2, col_2.replace("_", " ").title())
+                        with c2:
+                            st.markdown(f"##### {label_2}")
+                            st.bar_chart(df_filtrato[col_2], color=lista_colori[(i+1) % len(lista_colori)], height=450)
         else:
-            st.info("Nessuna metrica disponibile. Torna nel tab 'Uso dei Tracker' ed avvia l'elaborazione di almeno un algoritmo per popolare i grafici.")
+            st.info("Nessuna metrica disponibile. Avvia l'elaborazione di almeno un tracker.")
