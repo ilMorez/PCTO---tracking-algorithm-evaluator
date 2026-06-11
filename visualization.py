@@ -27,7 +27,7 @@ class Visualizer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # draw_tracks  — versione originale (singola classe, retrocompatibile)
+    # draw_tracks  — versione originale
     # ------------------------------------------------------------------
     def draw_tracks(
         self,
@@ -75,7 +75,7 @@ class Visualizer:
         print(f"Video salvato: {out_path}")
 
     # ------------------------------------------------------------------
-    # draw_multi_class_tracks  — NUOVO: più classi in un unico video
+    # draw_multi_class_tracks 
     # ------------------------------------------------------------------
     def draw_multi_class_tracks(
         self,
@@ -155,7 +155,7 @@ class Visualizer:
         print(f"Video multi-classe salvato: {out_path}")
 
     # ------------------------------------------------------------------
-    # draw_raw_detections  — invariato
+    # draw_raw_detections
     # ------------------------------------------------------------------
     def draw_raw_detections(
         self,
