@@ -139,7 +139,7 @@ def server_detect(video_path: Path, model_name: str, yolo_params: dict, target_c
 
 
 def server_track(video_path: Path, tracker_name: str, detections_data: list,
-                 tracker_params: dict, target_class: str = ""):
+                 tracker_params: dict, target_class: str = "", extract_crops: bool = False, output_dir: Path = None):
     endpoint = f"{SERVER_URL}/api/track"
     try:
         with open(video_path, "rb") as vf:
@@ -150,6 +150,7 @@ def server_track(video_path: Path, tracker_name: str, detections_data: list,
                     "detections_json":     json.dumps(detections_data),
                     "tracker_params_json": json.dumps(tracker_params),
                     "target_class":        target_class,
+                    "extract_crops":       extract_crops,
                 },
                 files={"video": (video_path.name, vf, "video/mp4")},
                 timeout=600,
@@ -168,6 +169,18 @@ def server_track(video_path: Path, tracker_name: str, detections_data: list,
         csv_name    = next((n for n in names if n.endswith(".csv")), None)
         video_bytes = zf.read(mp4_name) if mp4_name else None
         csv_bytes   = zf.read(csv_name) if csv_name else None
+        
+        if extract_crops and output_dir:
+            for member in zf.infolist():
+                if member.filename.startswith("crops/") and len(member.filename) > 6:
+                    if member.filename.endswith('/'):
+                        continue
+                    # Rimuove il prefisso 'crops/' così estrae direttamente la cartella classe accanto al CSV
+                    rel_path = Path(member.filename).relative_to("crops")
+                    target_path = output_dir / rel_path
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_bytes(zf.read(member))
+        
         results = []
         if csv_bytes:
             reader = _csv.DictReader(
@@ -184,11 +197,7 @@ def server_track(video_path: Path, tracker_name: str, detections_data: list,
         return None, None, None
 
 
-def server_track_multi(video_path: Path, assignments: list, detections_data: list):
-    """
-    assignments: lista di {"tracker_name", "target_class", "tracker_params"}
-    Ritorna (video_bytes, dict{label -> csv_bytes}) oppure (None, None)
-    """
+def server_track_multi(video_path: Path, assignments: list, detections_data: list, extract_crops: bool = False, output_dir: Path = None):
     endpoint = f"{SERVER_URL}/api/track_multi"
     try:
         with open(video_path, "rb") as vf:
@@ -197,6 +206,7 @@ def server_track_multi(video_path: Path, assignments: list, detections_data: lis
                 data={
                     "assignments_json": json.dumps(assignments),
                     "detections_json":  json.dumps(detections_data),
+                    "extract_crops":    extract_crops,  # <-- AGGIUNGI QUESTO
                 },
                 files={"video": (video_path.name, vf, "video/mp4")},
                 timeout=600,
@@ -214,6 +224,17 @@ def server_track_multi(video_path: Path, assignments: list, detections_data: lis
         mp4_name  = next((n for n in names if n.endswith(".mp4")), None)
         csv_names = [n for n in names if n.endswith(".csv")]
         video_bytes = zf.read(mp4_name) if mp4_name else None
+        
+        if extract_crops and output_dir:
+            for member in zf.infolist():
+                if member.filename.startswith("crops/") and len(member.filename) > 6:
+                    if member.filename.endswith('/'):
+                        continue
+                    rel_path = Path(member.filename).relative_to("crops")
+                    target_path = output_dir / rel_path
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_bytes(zf.read(member))
+        
         csv_map = {n.replace("_tracking.csv", ""): zf.read(n) for n in csv_names}
         return video_bytes, csv_map
     except requests.exceptions.ConnectionError:
@@ -440,12 +461,20 @@ if uploaded_file is not None:
         tracker_kwargs = render_tracker_parameters(TrackerClass, tracker_key=f"tab1_{tracker_type}")
 
         video_tracked_converted = video_output_folder / f"{tracker_type.lower()}_{single_class}_h264.mp4"
+        
+        extract_crops = st.checkbox(
+            "Estrai crop delle tracce (BBox)", 
+            value=False, 
+            key="tab1_extract_crops",
+            help="Salva le immagini croppate dell'oggetto lungo il suo percorso escludendo i bordi."
+        )
 
         if st.button("Avvia Elaborazione", key="btn_tab1"):
             with st.spinner(f"Tracking **{tracker_type}** su **{single_class}**…"):
                 risultati, tracked_bytes, csv_bytes = server_track(
                     video_salvato_path, tracker_type, detections_data,
                     tracker_kwargs, target_class=single_class,
+                    extract_crops=extract_crops, output_dir=video_output_folder,
                 )
             if risultati is None:
                 st.stop()
@@ -500,11 +529,19 @@ if uploaded_file is not None:
             })
 
         multi_video_path = video_output_folder / "multi_class_tracked_h264.mp4"
+        
+        extract_crops_multi = st.checkbox(
+            "Estrai crop delle tracce (BBox) per tutte le classi", 
+            value=False, 
+            key="tab2_extract_crops",
+            help="Salva le immagini croppate degli oggetti di tutte le classi lungo il loro percorso escludendo i bordi."
+        )
 
         if st.button("Avvia Multi-Tracking", key="btn_tab2"):
             with st.spinner("Multi-tracking in corso sul server…"):
                 video_bytes, csv_map = server_track_multi(
-                    video_salvato_path, assignments_ui, detections_data
+                    video_salvato_path, assignments_ui, detections_data,
+                    extract_crops=extract_crops_multi, output_dir=video_output_folder
                 )
             if video_bytes is None:
                 st.stop()
