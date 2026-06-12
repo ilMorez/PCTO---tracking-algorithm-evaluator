@@ -50,6 +50,21 @@ class BaseTracker(ABC):
         video_folder.mkdir(parents=True, exist_ok=True) # Crea la cartella (parents=True crea anche le parent directories se non esistono, exist_ok=True evita errore se la cartella esiste già)
         self.video_folder = video_folder
     
+    def _remap_track_ids(self, results: list) -> list:
+        """Rimappa i track_id in modo che siano incrementali a partire da 1,
+        nell'ordine in cui compaiono per la prima volta nel video."""
+        id_map = {}
+        counter = 1
+        for row in results:
+            tid = row["track_id"]
+            if tid != -1 and tid not in id_map:
+                id_map[tid] = counter
+                counter += 1
+        return [
+            {**row, "track_id": id_map.get(row["track_id"], row["track_id"])}
+            for row in results
+        ]
+    
     def save_to_csv(self, results: list, params: dict = None):
         """ Salva i risultati del tracking in un file CSV standardizzato:
             il file CSV ha sempre lo stesso formato per permettere all'evaluator di calcolare le metriche in modo uniforme.
@@ -61,7 +76,7 @@ class BaseTracker(ABC):
                 results: lista di dizionari con le tracce tracciate
                         ogni elemento: {"frame": int, "track_id": int, "x1": float, "y1": float, "x2": float, "y2": float, "time": float}
         """
-
+        results = self._remap_track_ids(results)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.csv_path = self.video_folder / f"{self.name.lower()}_{timestamp}.csv"
         header_names = ["frame", "track_id", "x1", "y1", "x2", "y2", "time"]
