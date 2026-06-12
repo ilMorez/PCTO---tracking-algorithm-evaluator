@@ -6,6 +6,7 @@ import shutil
 import zipfile
 import subprocess
 from pathlib import Path
+from collections import defaultdict
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -14,7 +15,7 @@ from custom_trackers import TRACKER_REGISTRY
 from detection import Detector, filter_detections_by_class
 from visualization import Visualizer, get_class_color
 
-# uvicorn server:app --host 0.0.0.0 --port 8000
+# Comando di avvio: uvicorn server:app --host 0.0.0.0 --port 8000
 
 app = FastAPI(title="Tracking Evaluator API Service")
 
@@ -55,8 +56,80 @@ def _make_zip(video_path: Path, csv_data: bytes, tracker_name: str) -> bytes:
     return buf.read()
 
 
+def extract_track_crops(video_path: str, results: list, output_base_dir: Path, num_crops=5, margin=5, default_class="unknown"):
+    """
+    Estrae i crop delle bbox dal video originale per ogni track_id unico.
+    Scarta le bbox che toccano i bordi dell'inquadratura ed estrae ~4 frame equispaziati.
+    Struttura finale: output_base_dir / nome_classe / track_id / frame_X.jpg
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return
+    
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # 1. Filtra ed evita le bbox che toccano i bordi dell'inquadratura (con un piccolo margine)
+    valid_results = []
+    for r in results:
+        x1, y1, x2, y2 = r['x1'], r['y1'], r['x2'], r['y2']
+        if x1 > margin and y1 > margin and x2 < (W - margin) and y2 < (H - margin):
+            valid_results.append(r)
+            
+    # 2. Raggruppa per Classe e poi per Track ID
+    tracks_by_class = defaultdict(lambda: defaultdict(list))
+    for r in valid_results:
+        cls_name = r.get('class_name') or r.get('label') or default_class
+        tracks_by_class[cls_name][r['track_id']].append(r)
+        
+    # 3. Seleziona fino a `num_crops` frame equispaziati nel tempo per ogni oggetto
+    frames_to_extract = defaultdict(list)
+    for cls_name, tracks in tracks_by_class.items():
+        for t_id, records in tracks.items():
+            records = sorted(records, key=lambda x: x['frame'])
+            if not records:
+                continue
+                
+            step = max(1, len(records) // num_crops)
+            selected_records = records[::step][:num_crops] 
+            
+            for rec in selected_records:
+                frames_to_extract[rec['frame']].append((cls_name, t_id, rec))
+                
+    if not frames_to_extract:
+        cap.release()
+        return
+
+    # 4. Scorri il video originale ed estrai i crop puliti
+    frame_idx = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        if frame_idx in frames_to_extract:
+            for cls_name, t_id, det in frames_to_extract[frame_idx]:
+                x1, y1, x2, y2 = int(det['x1']), int(det['y1']), int(det['x2']), int(det['y2'])
+                
+                # Clip per sicurezza coordinate
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(W, x2), min(H, y2)
+                
+                crop = frame[y1:y2, x1:x2]
+                if crop.size > 0:
+                    folder = output_base_dir / str(cls_name) / str(t_id)
+                    folder.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(folder / f"frame_{frame_idx}.jpg"), crop)
+                    
+        frame_idx += 1
+        
+    cap.release()
+
+
 # ---------------------------------------------------------------------------
-# /api/detect  — accetta target_classes (lista JSON)
+# /api/detect
 # ---------------------------------------------------------------------------
 
 @app.post("/api/detect")
@@ -108,7 +181,7 @@ async def process_detection(
 
         return JSONResponse({
             "status":          "success",
-            "detections":      detections,
+            "detections":       detections,
             "target_classes":  target_classes,
             "yolo_video":      video_b64,
         })
@@ -123,7 +196,7 @@ async def process_detection(
 
 
 # ---------------------------------------------------------------------------
-# /api/track  — tracker singolo su una classe
+# /api/track — tracker singolo su una classe
 # ---------------------------------------------------------------------------
 
 @app.post("/api/track")
@@ -131,7 +204,8 @@ async def process_tracking(
     tracker_name:        str        = Form(...),
     detections_json:     str        = Form(...),
     tracker_params_json: str        = Form("{}"),
-    target_class:        str        = Form(""),        
+    target_class:        str        = Form(""),       
+    extract_crops:       bool       = Form(False), 
     video:               UploadFile = File(...),
 ):
     if tracker_name not in TRACKER_REGISTRY:
@@ -143,7 +217,6 @@ async def process_tracking(
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Formato JSON non valido.")
 
-    # Filtra per classe se specificata
     if target_class:
         detections_data = filter_detections_by_class(detections_data, target_class)
 
@@ -151,6 +224,7 @@ async def process_tracking(
     tracked_video_path = TMP_DIR / f"{video.filename}.{tracker_name}.mp4"
     h264_video_path    = TMP_DIR / f"{video.filename}.{tracker_name}_h264.mp4"
     tmp_csv            = TMP_DIR / f"{tracker_name}_tmp.csv"
+    crops_dir          = TMP_DIR / f"{video.filename}_crops"
 
     try:
         with saved_video_path.open("wb") as buffer:
@@ -164,6 +238,7 @@ async def process_tracking(
         TrackerClass     = TRACKER_REGISTRY[tracker_name]
         tracker_instance = TrackerClass(**tracker_params)
         results          = tracker_instance.run(detections_data, par_video_path=str(saved_video_path))
+        results = tracker_instance._remap_track_ids(results)
 
         csv_data = _csv_bytes(results, tracker_name, params=tracker_params)
         tmp_csv.write_bytes(csv_data)
@@ -181,7 +256,29 @@ async def process_tracking(
         if not video_src.exists():
             raise RuntimeError("Generazione video tracciato fallita.")
 
-        zip_bytes = _make_zip(video_src, csv_data, tracker_name.lower())
+        # Esegui l'estrazione dei crop se richiesto (dal video sorgente originale, pulito!)
+        if extract_crops:
+            extract_track_crops(
+                video_path=str(saved_video_path),
+                results=results,
+                output_base_dir=crops_dir,
+                default_class=target_class or "unknown"
+            )
+
+        # Costruzione dinamica dello ZIP per supportare la cartella dei crop
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(video_src, arcname=f"{tracker_name.lower()}_tracked.mp4")
+            zf.writestr(f"{tracker_name.lower()}_tracking.csv", csv_data)
+            
+            if extract_crops and crops_dir.exists():
+                for root, _, files in os.walk(crops_dir):
+                    for file in files:
+                        file_path = Path(root) / file
+                        arc_name = f"crops/{file_path.relative_to(crops_dir)}"
+                        zf.write(file_path, arcname=arc_name)
+        buf.seek(0)
+        zip_bytes = buf.read()
 
         return StreamingResponse(
             io.BytesIO(zip_bytes),
@@ -199,21 +296,17 @@ async def process_tracking(
                     os.remove(p)
                 except Exception:
                     pass
+        if crops_dir.exists():
+            shutil.rmtree(crops_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
-# /api/track_multi  — N tracker (uno per classe) → unico video merged + N CSV
+# /api/track_multi
 # ---------------------------------------------------------------------------
 
 @app.post("/api/track_multi")
 async def process_tracking_multi(
     assignments_json:    str        = Form(...),
-    # assignments_json: lista di oggetti:
-    # [
-    #   {"tracker_name": "DeepSORT", "target_class": "car",    "tracker_params": {...}},
-    #   {"tracker_name": "ByteTrack", "target_class": "person", "tracker_params": {...}},
-    #   ...
-    # ]
     detections_json:     str        = Form(...),
     video:               UploadFile = File(...),
 ):
@@ -243,8 +336,8 @@ async def process_tracking_multi(
     tmp_files = [saved_video_path, merged_video_path, h264_merged_path]
 
     try:
-        track_layers = []   # per Visualizer.draw_multi_class_tracks
-        csv_entries  = {}   # class -> csv_bytes (per lo zip)
+        track_layers = []   
+        csv_entries  = {}   
 
         for idx, assignment in enumerate(assignments):
             tracker_name   = assignment["tracker_name"]
@@ -253,18 +346,16 @@ async def process_tracking_multi(
 
             print(f"=== Multi-track [{idx+1}/{len(assignments)}]: {tracker_name} → {target_class} ===")
 
-            # Filtra detection per questa classe
             filtered_dets = filter_detections_by_class(detections_data, target_class)
 
             TrackerClass     = TRACKER_REGISTRY[tracker_name]
             tracker_instance = TrackerClass(**tracker_params)
             results          = tracker_instance.run(filtered_dets, par_video_path=str(saved_video_path))
+            results = tracker_instance._remap_track_ids(results)
 
-            # CSV per questa classe
             csv_data = _csv_bytes(results, tracker_name, params=tracker_params)
             csv_entries[f"{target_class}_{tracker_name.lower()}"] = csv_data
 
-            # Salva CSV temporaneo per Visualizer
             tmp_csv = TMP_DIR / f"multi_{idx}_{tracker_name}.csv"
             tmp_csv.write_bytes(csv_data)
             tmp_files.append(tmp_csv)
@@ -276,7 +367,6 @@ async def process_tracking_multi(
                 "label":    target_class,
             })
 
-        # Video merged con tutti i layer
         visualizer = Visualizer(par_output_dir=str(TMP_DIR))
         visualizer.draw_multi_class_tracks(
             track_layers=track_layers,
@@ -289,7 +379,6 @@ async def process_tracking_multi(
         if not video_src.exists():
             raise RuntimeError("Generazione video merged fallita.")
 
-        # Costruisci ZIP: video + un CSV per ogni classe
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(video_src, arcname="multi_tracked.mp4")
