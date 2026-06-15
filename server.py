@@ -2,14 +2,18 @@ import os
 import io
 import csv
 import json
+import time
+import uuid
 import shutil
 import zipfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 from pathlib import Path
 from collections import defaultdict
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 
 from custom_trackers import TRACKER_REGISTRY
 from detection import Detector, filter_detections_by_class
@@ -21,6 +25,55 @@ app = FastAPI(title="Tracking Evaluator API Service")
 
 TMP_DIR = Path("server_tmp_videos")
 TMP_DIR.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Cache delle detection per evitare di ritrasmettere detections_json a ogni
+# chiamata di tracking. Le voci scadono dopo DETECTION_CACHE_TTL secondi.
+# ---------------------------------------------------------------------------
+DETECTION_CACHE: dict[str, dict] = {}
+DETECTION_CACHE_TTL = 3600  # 1 ora
+_cache_lock = threading.Lock()
+
+
+def _store_detections(detections: list, raw_video_path: Path | None) -> str:
+    detection_id = uuid.uuid4().hex
+    with _cache_lock:
+        DETECTION_CACHE[detection_id] = {
+            "detections": detections,
+            "raw_video": str(raw_video_path) if raw_video_path else None,
+            "created":    time.time(),
+        }
+    return detection_id
+
+
+def _get_detections(detection_id: str) -> list | None:
+    with _cache_lock:
+        entry = DETECTION_CACHE.get(detection_id)
+        if not entry:
+            return None
+        if time.time() - entry["created"] > DETECTION_CACHE_TTL:
+            DETECTION_CACHE.pop(detection_id, None)
+            _cleanup_cached_video(entry)
+            return None
+        return entry["detections"]
+
+
+def _get_cached_raw_video(detection_id: str) -> Path | None:
+    with _cache_lock:
+        entry = DETECTION_CACHE.get(detection_id)
+        if not entry or not entry.get("raw_video"):
+            return None
+        p = Path(entry["raw_video"])
+        return p if p.exists() else None
+
+
+def _cleanup_cached_video(entry: dict):
+    raw = entry.get("raw_video")
+    if raw and Path(raw).exists():
+        try:
+            os.remove(raw)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -56,34 +109,22 @@ def _make_zip(video_path: Path, csv_data: bytes, tracker_name: str) -> bytes:
     return buf.read()
 
 
-def extract_track_crops(video_path: str, results: list, output_base_dir: Path, num_crops=5, margin=5, default_class="unknown"):
-    """
-    Estrae i crop delle bbox dal video originale per ogni track_id unico.
-    Scarta le bbox che toccano i bordi dell'inquadratura ed estrae ~4 frame equispaziati.
-    Struttura finale: output_base_dir / nome_classe / track_id / frame_X.jpg
-    """
-    import cv2
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return
-    
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    # 1. Filtra ed evita le bbox che toccano i bordi dell'inquadratura (con un piccolo margine)
+def _compute_crops_to_extract(results: list, W: int, H: int, tracker_name: str,
+                               num_crops=5, margin=5, default_class="unknown"):
+    """Calcola, per un tracker, quali (frame, classe, track_id, bbox) estrarre. Non apre il video."""
+    # 1. Filtra le bbox che toccano i bordi dell'inquadratura (con un piccolo margine)
     valid_results = []
     for r in results:
         x1, y1, x2, y2 = r['x1'], r['y1'], r['x2'], r['y2']
         if x1 > margin and y1 > margin and x2 < (W - margin) and y2 < (H - margin):
             valid_results.append(r)
-            
+
     # 2. Raggruppa per Classe e poi per Track ID
     tracks_by_class = defaultdict(lambda: defaultdict(list))
     for r in valid_results:
         cls_name = r.get('class_name') or r.get('label') or default_class
         tracks_by_class[cls_name][r['track_id']].append(r)
-        
+
     # 3. Seleziona fino a `num_crops` frame equispaziati nel tempo per ogni oggetto
     frames_to_extract = defaultdict(list)
     for cls_name, tracks in tracks_by_class.items():
@@ -91,41 +132,75 @@ def extract_track_crops(video_path: str, results: list, output_base_dir: Path, n
             records = sorted(records, key=lambda x: x['frame'])
             if not records:
                 continue
-                
+
             step = max(1, len(records) // num_crops)
-            selected_records = records[::step][:num_crops] 
-            
+            selected_records = records[::step][:num_crops]
+
             for rec in selected_records:
-                frames_to_extract[rec['frame']].append((cls_name, t_id, rec))
-                
+                frames_to_extract[rec['frame']].append((tracker_name, cls_name, t_id, rec))
+
+    return frames_to_extract
+
+
+def _write_crops_single_pass(video_path: str, output_base_dir: Path, frames_to_extract: dict, W: int, H: int):
+    """Una singola passata sul video: scrive i crop richiesti da uno o più tracker.
+
+    frames_to_extract: {frame_idx: [(tracker_name, cls_name, track_id, rec), ...]}
+    """
+    import cv2
+
     if not frames_to_extract:
-        cap.release()
         return
 
-    # 4. Scorri il video originale ed estrai i crop puliti
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return
+
     frame_idx = 0
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-            
+
         if frame_idx in frames_to_extract:
-            for cls_name, t_id, det in frames_to_extract[frame_idx]:
+            for tracker_name, cls_name, t_id, det in frames_to_extract[frame_idx]:
                 x1, y1, x2, y2 = int(det['x1']), int(det['y1']), int(det['x2']), int(det['y2'])
-                
+
                 # Clip per sicurezza coordinate
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(W, x2), min(H, y2)
-                
+
                 crop = frame[y1:y2, x1:x2]
                 if crop.size > 0:
-                    folder = output_base_dir / str(cls_name) / str(t_id)
+                    folder = output_base_dir / str(tracker_name) / str(cls_name) / str(t_id)
                     folder.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(folder / f"frame_{frame_idx}.jpg"), crop)
-                    
+
         frame_idx += 1
-        
+
     cap.release()
+
+
+def extract_track_crops(video_path: str, results: list, output_base_dir: Path, tracker_name: str,
+                         num_crops=5, margin=5, default_class="unknown"):
+    """
+    Estrae i crop delle bbox dal video originale per ogni track_id unico (singolo tracker).
+    Scarta le bbox che toccano i bordi dell'inquadratura ed estrae ~num_crops frame equispaziati.
+    Struttura finale: output_base_dir / tracker_name / nome_classe / track_id / frame_X.jpg
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    frames_to_extract = _compute_crops_to_extract(
+        results, W, H, tracker_name, num_crops=num_crops, margin=margin, default_class=default_class
+    )
+    _write_crops_single_pass(video_path, output_base_dir, frames_to_extract, W, H)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +225,7 @@ async def process_detection(
     saved_video_path = TMP_DIR / video.filename
     tmp_json         = TMP_DIR / f"{video.filename}.detections.json"
     raw_video_path   = TMP_DIR / f"{video.filename}.raw.mp4"
-    h264_video_path  = TMP_DIR / f"{video.filename}.raw_h264.mp4"
+    h264_video_path  = TMP_DIR / f"{uuid.uuid4().hex}_raw_h264.mp4"
 
     try:
         with saved_video_path.open("wb") as buffer:
@@ -174,25 +249,37 @@ async def process_detection(
         visualizer.draw_raw_detections(detections, raw_video_path.name, str(saved_video_path))
 
         converted = _to_h264(raw_video_path, h264_video_path)
-        video_b64 = None
-        if converted and h264_video_path.exists():
-            import base64
-            video_b64 = base64.b64encode(h264_video_path.read_bytes()).decode()
+        cached_video_path = h264_video_path if (converted and h264_video_path.exists()) else None
+
+        # Salva le detections (e il path del video grezzo h264) in cache,
+        # così le chiamate successive a /api/track* possono riferirle via ID
+        # invece di ritrasmetterle, e il video può essere scaricato in streaming.
+        detection_id = _store_detections(detections, cached_video_path)
 
         return JSONResponse({
-            "status":          "success",
-            "detections":       detections,
-            "target_classes":  target_classes,
-            "yolo_video":      video_b64,
+            "status":         "success",
+            "detections":     detections,
+            "detection_id":   detection_id,
+            "target_classes": target_classes,
+            "has_raw_video":  cached_video_path is not None,
         })
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore durante la detection: {e}")
 
     finally:
-        for p in (saved_video_path, tmp_json, raw_video_path, h264_video_path):
+        for p in (saved_video_path, tmp_json, raw_video_path):
             if p.exists():
                 os.remove(p)
+
+
+@app.get("/api/detect/{detection_id}/video")
+async def get_detect_video(detection_id: str):
+    """Scarica in streaming il video con i rilevamenti grezzi associato a un detection_id."""
+    video_path = _get_cached_raw_video(detection_id)
+    if video_path is None:
+        raise HTTPException(status_code=404, detail="Video non trovato o scaduto.")
+    return FileResponse(str(video_path), media_type="video/mp4", filename="raw_detections_h264.mp4")
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +289,8 @@ async def process_detection(
 @app.post("/api/track")
 async def process_tracking(
     tracker_name:        str        = Form(...),
-    detections_json:     str        = Form(...),
+    detections_json:     str | None = Form(None),
+    detection_id:        str | None = Form(None),
     tracker_params_json: str        = Form("{}"),
     target_class:        str        = Form(""),       
     extract_crops:       bool       = Form(False), 
@@ -212,10 +300,23 @@ async def process_tracking(
         raise HTTPException(status_code=400, detail=f"Tracker '{tracker_name}' non supportato.")
 
     try:
-        detections_data = json.loads(detections_json)
-        tracker_params  = json.loads(tracker_params_json)
+        tracker_params = json.loads(tracker_params_json)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Formato JSON non valido.")
+        raise HTTPException(status_code=400, detail="Formato JSON non valido (tracker_params_json).")
+
+    # Preferisce il detection_id (dati già in cache sul server); fallback su detections_json.
+    detections_data = None
+    if detection_id:
+        detections_data = _get_detections(detection_id)
+        if detections_data is None:
+            raise HTTPException(status_code=404, detail="detection_id non trovato o scaduto. Rifare la detection.")
+    elif detections_json:
+        try:
+            detections_data = json.loads(detections_json)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Formato JSON non valido (detections_json).")
+    else:
+        raise HTTPException(status_code=400, detail="Specificare detection_id o detections_json.")
 
     if target_class:
         detections_data = filter_detections_by_class(detections_data, target_class)
@@ -262,6 +363,7 @@ async def process_tracking(
                 video_path=str(saved_video_path),
                 results=results,
                 output_base_dir=crops_dir,
+                tracker_name=tracker_name,
                 default_class=target_class or "unknown"
             )
 
@@ -307,14 +409,29 @@ async def process_tracking(
 @app.post("/api/track_multi")
 async def process_tracking_multi(
     assignments_json:    str        = Form(...),
-    detections_json:     str        = Form(...),
+    detections_json:     str | None = Form(None),
+    detection_id:        str | None = Form(None),
+    extract_crops:       bool       = Form(False),
     video:               UploadFile = File(...),
 ):
     try:
-        assignments     = json.loads(assignments_json)
-        detections_data = json.loads(detections_json)
+        assignments = json.loads(assignments_json)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Formato JSON non valido.")
+        raise HTTPException(status_code=400, detail="Formato JSON non valido (assignments_json).")
+
+    # Preferisce il detection_id (dati già in cache sul server); fallback su detections_json.
+    detections_data = None
+    if detection_id:
+        detections_data = _get_detections(detection_id)
+        if detections_data is None:
+            raise HTTPException(status_code=404, detail="detection_id non trovato o scaduto. Rifare la detection.")
+    elif detections_json:
+        try:
+            detections_data = json.loads(detections_json)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Formato JSON non valido (detections_json).")
+    else:
+        raise HTTPException(status_code=400, detail="Specificare detection_id o detections_json.")
 
     if not assignments:
         raise HTTPException(status_code=400, detail="assignments_json non può essere vuota.")
@@ -326,6 +443,7 @@ async def process_tracking_multi(
     saved_video_path = TMP_DIR / video.filename
     merged_video_path = TMP_DIR / f"{video.filename}.multi.mp4"
     h264_merged_path  = TMP_DIR / f"{video.filename}.multi_h264.mp4"
+    crops_dir         = TMP_DIR / f"{video.filename}_multi_crops"
 
     try:
         with saved_video_path.open("wb") as buffer:
@@ -337,9 +455,17 @@ async def process_tracking_multi(
 
     try:
         track_layers = []   
-        csv_entries  = {}   
+        csv_entries  = {}
+        all_frames_to_extract = defaultdict(list)
+        cap_w = cap_h = None
+        if extract_crops:
+            import cv2
+            _cap = cv2.VideoCapture(str(saved_video_path))
+            cap_w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            cap_h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            _cap.release()
 
-        for idx, assignment in enumerate(assignments):
+        def _run_single_assignment(idx, assignment):
             tracker_name   = assignment["tracker_name"]
             target_class   = assignment["target_class"]
             tracker_params = assignment.get("tracker_params", {})
@@ -354,18 +480,53 @@ async def process_tracking_multi(
             results = tracker_instance._remap_track_ids(results)
 
             csv_data = _csv_bytes(results, tracker_name, params=tracker_params)
-            csv_entries[f"{target_class}_{tracker_name.lower()}"] = csv_data
 
             tmp_csv = TMP_DIR / f"multi_{idx}_{tracker_name}.csv"
             tmp_csv.write_bytes(csv_data)
-            tmp_files.append(tmp_csv)
+
+            fte = None
+            if extract_crops:
+                fte = _compute_crops_to_extract(
+                    results, cap_w, cap_h, tracker_name,
+                    default_class=target_class or "unknown"
+                )
+
+            return {
+                "idx": idx, "tracker_name": tracker_name, "target_class": target_class,
+                "csv_key": f"{target_class}_{tracker_name.lower()}", "csv_data": csv_data,
+                "tmp_csv": tmp_csv, "fte": fte,
+            }
+
+        # Tracker indipendenti tra loro: eseguiti in parallelo (thread pool).
+        # Non parallelizzare la detection YOLO/GPU: causerebbe contention sulla GPU.
+        max_workers = min(len(assignments), os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_run_single_assignment, idx, a): idx
+                       for idx, a in enumerate(assignments)}
+            results_by_idx = {}
+            for future in as_completed(futures):
+                r = future.result()
+                results_by_idx[r["idx"]] = r
+
+        for idx in range(len(assignments)):
+            r = results_by_idx[idx]
+            csv_entries[r["csv_key"]] = r["csv_data"]
+            tmp_files.append(r["tmp_csv"])
+
+            if extract_crops and r["fte"]:
+                for frame_idx, items in r["fte"].items():
+                    all_frames_to_extract[frame_idx].extend(items)
 
             color = get_class_color(idx)
             track_layers.append({
-                "csv_path": str(tmp_csv),
+                "csv_path": str(r["tmp_csv"]),
                 "color":    color,
-                "label":    target_class,
+                "label":    r["target_class"],
             })
+
+        # Singola passata sul video per scrivere tutti i crop di tutti gli assignment
+        if extract_crops and all_frames_to_extract:
+            _write_crops_single_pass(str(saved_video_path), crops_dir, all_frames_to_extract, cap_w, cap_h)
 
         visualizer = Visualizer(par_output_dir=str(TMP_DIR))
         visualizer.draw_multi_class_tracks(
@@ -384,6 +545,13 @@ async def process_tracking_multi(
             zf.write(video_src, arcname="multi_tracked.mp4")
             for name, data in csv_entries.items():
                 zf.writestr(f"{name}_tracking.csv", data)
+
+            if extract_crops and crops_dir.exists():
+                for root, _, files in os.walk(crops_dir):
+                    for file in files:
+                        file_path = Path(root) / file
+                        arc_name = f"crops/{file_path.relative_to(crops_dir)}"
+                        zf.write(file_path, arcname=arc_name)
         buf.seek(0)
 
         return StreamingResponse(
@@ -402,3 +570,5 @@ async def process_tracking_multi(
                     os.remove(p)
                 except Exception:
                     pass
+        if crops_dir.exists():
+            shutil.rmtree(crops_dir, ignore_errors=True)
