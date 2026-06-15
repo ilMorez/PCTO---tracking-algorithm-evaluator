@@ -26,6 +26,8 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 if "detections_data" not in st.session_state:
     st.session_state["detections_data"] = None
+if "detection_id" not in st.session_state:
+    st.session_state["detection_id"] = None
 if "detections_video_key" not in st.session_state:
     st.session_state["detections_video_key"] = None
 
@@ -64,11 +66,18 @@ with st.sidebar:
     yolo_imgsz   = st.selectbox("imgsz", [320, 416, 480, 640, 768, 1024, 1280], index=3)
     yolo_half    = st.checkbox("Half precision (FP16)", value=False)
     yolo_verbose = st.checkbox("Verbose YOLO", value=False)
+    yolo_device  = st.selectbox(
+        "Device", ["auto", "cpu", "cuda:0"], index=0,
+        help="'auto' lascia decidere a YOLO (GPU se disponibile sul server). "
+             "Forza 'cuda:0' se il server ha una GPU, 'cpu' altrimenti.",
+    )
 
     yolo_params = {
         "conf": yolo_conf, "iou": yolo_iou, "imgsz": yolo_imgsz,
         "half": yolo_half, "stream": True, "verbose": yolo_verbose,
     }
+    if yolo_device != "auto":
+        yolo_params["device"] = yolo_device
 
     st.markdown("---")
     st.header("Classi da rilevare")
@@ -104,6 +113,12 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 def server_detect(video_path: Path, model_name: str, yolo_params: dict, target_classes: list):
+    """Esegue la detection sul server. Ritorna (detections, detection_id, yolo_video_bytes).
+
+    Il video grezzo NON viene incluso nella risposta JSON principale (niente base64):
+    se il server fornisce un detection_id, il video va scaricato separatamente con
+    server_fetch_detect_video().
+    """
     endpoint = f"{SERVER_URL}/api/detect"
     try:
         with open(video_path, "rb") as vf:
@@ -124,34 +139,65 @@ def server_detect(video_path: Path, model_name: str, yolo_params: dict, target_c
             except Exception:
                 detail = resp.text
             st.error(f"Errore `/api/detect` [{resp.status_code}]:\n```\n{detail[:1000]}\n```")
-            return None, None
-        data        = resp.json()
-        detections  = data.get("detections")
-        yolo_b64    = data.get("yolo_video")
-        video_bytes = base64.b64decode(yolo_b64) if yolo_b64 else None
-        return detections, video_bytes
+            return None, None, None
+        data         = resp.json()
+        detections   = data.get("detections")
+        detection_id = data.get("detection_id")
+
+        video_bytes = None
+        if data.get("has_raw_video") and detection_id:
+            video_bytes = server_fetch_detect_video(detection_id)
+        elif data.get("yolo_video"):
+            # Fallback legacy: server vecchio che manda ancora il video in base64
+            video_bytes = base64.b64decode(data["yolo_video"])
+
+        return detections, detection_id, video_bytes
     except requests.exceptions.ConnectionError:
         st.error(f"Impossibile connettersi al server: `{endpoint}`")
-        return None, None
+        return None, None, None
     except Exception as e:
         st.error(f"Errore `/api/detect`:\n```\n{e}\n```")
-        return None, None
+        return None, None, None
+
+
+def server_fetch_detect_video(detection_id: str):
+    """Scarica in streaming il video con i rilevamenti grezzi, dato un detection_id."""
+    endpoint = f"{SERVER_URL}/api/detect/{detection_id}/video"
+    try:
+        resp = requests.get(
+            endpoint, timeout=600,
+            proxies={"http": None, "https": None},
+        )
+        if resp.status_code != 200:
+            # Non bloccante: il video grezzo è opzionale
+            return None
+        return resp.content
+    except Exception:
+        return None
 
 
 def server_track(video_path: Path, tracker_name: str, detections_data: list,
-                 tracker_params: dict, target_class: str = "", extract_crops: bool = False, output_dir: Path = None):
+                 tracker_params: dict, target_class: str = "", extract_crops: bool = False,
+                 output_dir: Path = None, detection_id: str = None):
     endpoint = f"{SERVER_URL}/api/track"
     try:
+        data = {
+            "tracker_name":        tracker_name,
+            "tracker_params_json": json.dumps(tracker_params),
+            "target_class":        target_class,
+            "extract_crops":       extract_crops,
+        }
+        # Preferisce detection_id (dati già in cache sul server): evita di
+        # ritrasmettere l'intera struttura detections a ogni richiesta.
+        if detection_id:
+            data["detection_id"] = detection_id
+        else:
+            data["detections_json"] = json.dumps(detections_data)
+
         with open(video_path, "rb") as vf:
             resp = requests.post(
                 endpoint,
-                data={
-                    "tracker_name":        tracker_name,
-                    "detections_json":     json.dumps(detections_data),
-                    "tracker_params_json": json.dumps(tracker_params),
-                    "target_class":        target_class,
-                    "extract_crops":       extract_crops,
-                },
+                data=data,
                 files={"video": (video_path.name, vf, "video/mp4")},
                 timeout=600,
                 proxies={"http": None, "https": None},
@@ -161,6 +207,14 @@ def server_track(video_path: Path, tracker_name: str, detections_data: list,
                 detail = resp.json().get("detail", resp.text)
             except Exception:
                 detail = resp.text
+            # Se il detection_id non è più valido sul server (cache scaduta),
+            # ritenta una sola volta inviando i dati completi.
+            if resp.status_code == 404 and detection_id and detections_data is not None:
+                return server_track(
+                    video_path, tracker_name, detections_data, tracker_params,
+                    target_class=target_class, extract_crops=extract_crops,
+                    output_dir=output_dir, detection_id=None,
+                )
             st.error(f"Errore `/api/track` [{resp.status_code}]:\n```\n{detail[:1000]}\n```")
             return None, None, None
         zf          = zipfile.ZipFile(io.BytesIO(resp.content))
@@ -197,17 +251,24 @@ def server_track(video_path: Path, tracker_name: str, detections_data: list,
         return None, None, None
 
 
-def server_track_multi(video_path: Path, assignments: list, detections_data: list, extract_crops: bool = False, output_dir: Path = None):
+def server_track_multi(video_path: Path, assignments: list, detections_data: list,
+                        extract_crops: bool = False, output_dir: Path = None,
+                        detection_id: str = None):
     endpoint = f"{SERVER_URL}/api/track_multi"
     try:
+        data = {
+            "assignments_json": json.dumps(assignments),
+            "extract_crops":    extract_crops,
+        }
+        if detection_id:
+            data["detection_id"] = detection_id
+        else:
+            data["detections_json"] = json.dumps(detections_data)
+
         with open(video_path, "rb") as vf:
             resp = requests.post(
                 endpoint,
-                data={
-                    "assignments_json": json.dumps(assignments),
-                    "detections_json":  json.dumps(detections_data),
-                    "extract_crops":    extract_crops,  # <-- AGGIUNGI QUESTO
-                },
+                data=data,
                 files={"video": (video_path.name, vf, "video/mp4")},
                 timeout=600,
                 proxies={"http": None, "https": None},
@@ -217,6 +278,11 @@ def server_track_multi(video_path: Path, assignments: list, detections_data: lis
                 detail = resp.json().get("detail", resp.text)
             except Exception:
                 detail = resp.text
+            if resp.status_code == 404 and detection_id and detections_data is not None:
+                return server_track_multi(
+                    video_path, assignments, detections_data,
+                    extract_crops=extract_crops, output_dir=output_dir, detection_id=None,
+                )
             st.error(f"Errore `/api/track_multi` [{resp.status_code}]:\n```\n{detail[:1000]}\n```")
             return None, None
         zf        = zipfile.ZipFile(io.BytesIO(resp.content))
@@ -384,9 +450,10 @@ if uploaded_file is not None:
         )
  
     if st.button("Avvia Detection", key="btn_det"):
+        detection_id = None
         if not detections_json_path.exists():
             with st.spinner(f"Detection in corso con **{model_name}** per classi: {selected_classes}…"):
-                det_result, yolo_video_bytes = server_detect(
+                det_result, detection_id, yolo_video_bytes = server_detect(
                     video_salvato_path, model_name, yolo_params, selected_classes
                 )
             if det_result is None:
@@ -400,11 +467,13 @@ if uploaded_file is not None:
                 det_result = json.load(f)
  
         st.session_state["detections_data"]      = det_result
+        st.session_state["detection_id"]         = detection_id
         st.session_state["detections_video_key"] = detection_key
         warning_placeholder.empty()
 
     # Legge da session_state: persiste tra re-run senza rieseguire la detection
     detections_data = st.session_state["detections_data"]
+    detection_id    = st.session_state["detection_id"]
 
     # Info video + conteggio classi (visibile solo se detection disponibile)
     if detections_data is not None:
@@ -460,7 +529,9 @@ if uploaded_file is not None:
         TrackerClass   = TRACKER_REGISTRY[tracker_type]
         tracker_kwargs = render_tracker_parameters(TrackerClass, tracker_key=f"tab1_{tracker_type}")
 
-        video_tracked_converted = video_output_folder / f"{tracker_type.lower()}_{single_class}_h264.mp4"
+        tracker_dir = video_output_folder / tracker_type
+        tracker_dir.mkdir(parents=True, exist_ok=True)
+        video_tracked_converted = tracker_dir / f"{tracker_type.lower()}_{single_class}_h264.mp4"
         
         extract_crops = st.checkbox(
             "Estrai crop delle tracce (BBox)", 
@@ -475,6 +546,7 @@ if uploaded_file is not None:
                     video_salvato_path, tracker_type, detections_data,
                     tracker_kwargs, target_class=single_class,
                     extract_crops=extract_crops, output_dir=video_output_folder,
+                    detection_id=detection_id,
                 )
             if risultati is None:
                 st.stop()
@@ -482,7 +554,7 @@ if uploaded_file is not None:
                 video_tracked_converted.write_bytes(tracked_bytes)
             if csv_bytes:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                csv_path  = video_output_folder / f"{tracker_type.lower()}_{single_class}_{timestamp}.csv"
+                csv_path  = tracker_dir / f"{tracker_type.lower()}_{single_class}_{timestamp}.csv"
                 csv_path.write_bytes(csv_bytes)
 
         v_col1, v_col2 = st.columns(2)
@@ -541,19 +613,23 @@ if uploaded_file is not None:
             with st.spinner("Multi-tracking in corso sul server…"):
                 video_bytes, csv_map = server_track_multi(
                     video_salvato_path, assignments_ui, detections_data,
-                    extract_crops=extract_crops_multi, output_dir=video_output_folder
+                    extract_crops=extract_crops_multi, output_dir=video_output_folder,
+                    detection_id=detection_id,
                 )
             if video_bytes is None:
                 st.stop()
             multi_video_path.write_bytes(video_bytes)
             if csv_map:
-                # csv_map keys dal server: "{target_class}_{tracker_name.lower()}"
                 for name, data in csv_map.items():
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    parts     = name.split("_", 1)   # es. "car_deepsort" -> ["car","deepsort"]
+                    parts     = name.split("_", 1)
                     cls_part  = parts[0] if len(parts) > 1 else name
                     trk_part  = parts[1] if len(parts) > 1 else "unknown"
-                    p = video_output_folder / f"{trk_part}_{cls_part}_{timestamp}.csv"
+                    original_trk_name = next((t for t in TRACKER_REGISTRY.keys() if t.lower() == trk_part), trk_part)
+                    trk_dir = video_output_folder / original_trk_name
+                    trk_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    p = trk_dir / f"{trk_part}_{cls_part}_{timestamp}.csv"
                     p.write_bytes(data)
 
         if multi_video_path.exists():
@@ -576,13 +652,16 @@ if uploaded_file is not None:
                 )
                 TrackerCls_  = TRACKER_REGISTRY[trk_type]
                 trk_kwargs_  = render_tracker_parameters(TrackerCls_, tracker_key=f"{trk_type.lower()}_{suffix}")
-                video_out_   = video_output_folder / f"{trk_type.lower()}_{vs_class}_{suffix}_h264.mp4"
+                trk_dir = video_output_folder / trk_type
+                trk_dir.mkdir(parents=True, exist_ok=True)
+                video_out_ = trk_dir / f"{trk_type.lower()}_{vs_class}_{suffix}_h264.mp4"
 
                 if st.button("Avvia Elaborazione", key=f"btn_{suffix}"):
                     with st.spinner(f"Tracking **{trk_type}** su **{vs_class}**…"):
                         risultati, tracked_bytes, csv_bytes = server_track(
                             video_salvato_path, trk_type, detections_data,
                             trk_kwargs_, target_class=vs_class,
+                            detection_id=detection_id,
                         )
                     if risultati is None:
                         st.stop()
@@ -590,7 +669,7 @@ if uploaded_file is not None:
                         video_out_.write_bytes(tracked_bytes)
                     if csv_bytes:
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        p = video_output_folder / f"{trk_type.lower()}_{vs_class}_{timestamp}.csv"
+                        p = trk_dir / f"{trk_type.lower()}_{vs_class}_{timestamp}.csv"
                         p.write_bytes(csv_bytes)
 
                 st.markdown(f"**Video Tracciato ({trk_type} — {vs_class}):**")
@@ -607,7 +686,7 @@ if uploaded_file is not None:
  
         metriche_globali = {}
  
-        all_csvs = sorted(video_output_folder.glob("*.csv"))
+        all_csvs = sorted(video_output_folder.rglob("*.csv"))
         tracker_names_lower = {t.lower(): t for t in TRACKER_REGISTRY.keys()}
         best_csv = {}
  
