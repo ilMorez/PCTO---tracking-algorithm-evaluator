@@ -86,6 +86,7 @@ class DeepSortTracker(BaseTracker):
         self.orig = par_orig
         self.text_query = text_query
         self.text_threshold = text_threshold
+        self.track_embeddings = {}
         
         if self.is_clip:
             print("[DeepSORT] Inizializzazione pipeline CLIP...")
@@ -131,6 +132,20 @@ class DeepSortTracker(BaseTracker):
         # Normalizzazione
         features = features / features.norm(p=2, dim=-1, keepdim=True)
         return list(features.cpu().numpy())
+    
+    def save_embeddings(self, video_id: str, out_path: str = "embeddings_db.npz"):  
+        import os
+        new_data = {
+            f"{video_id}__{tid}": np.mean(embs, axis=0)
+            for tid, embs in self.track_embeddings.items() if embs
+        }
+        if os.path.exists(out_path):
+            existing = dict(np.load(out_path))
+            existing.update(new_data)
+            np.savez(out_path, **existing)
+        else:
+            np.savez(out_path, **new_data)
+
        
     def run(self, par_detections_data: list, par_video_path: str, progress_callback=None) -> list:
         results = []
@@ -195,6 +210,9 @@ class DeepSortTracker(BaseTracker):
                             "x1": float(l), "y1": float(t_y), "x2": float(r), "y2": float(b),
                             "time": elapsed_time
                         })
+                        if self.is_clip and embeds:
+                            tid = int(t.track_id)
+                            self.track_embeddings.setdefault(tid, []).append(np.mean(embeds, axis=0))
                 except Exception as tracker_err:
                     print(f"\n[ERRORE] Errore critico nel loop delle tracce al frame {frame_number}: {tracker_err}")
                     traceback.print_exc()
