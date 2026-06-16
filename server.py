@@ -340,6 +340,14 @@ async def process_tracking(
         tracker_instance = TrackerClass(**tracker_params)
         results          = tracker_instance.run(detections_data, par_video_path=str(saved_video_path))
         results = tracker_instance._remap_track_ids(results)
+        
+        embeddings_path = None                                
+        if hasattr(tracker_instance, 'save_embeddings'):
+            video_id = Path(video.filename).stem
+            embeddings_npz = TMP_DIR / f"{tracker_name}_{video_id}_embeddings.npz"
+            tracker_instance.save_embeddings(video_id=video_id, out_path=str(embeddings_npz))
+            embeddings_path = embeddings_npz
+
 
         csv_data = _csv_bytes(results, tracker_name, params=tracker_params)
         tmp_csv.write_bytes(csv_data)
@@ -379,6 +387,8 @@ async def process_tracking(
                         file_path = Path(root) / file
                         arc_name = f"crops/{file_path.relative_to(crops_dir)}"
                         zf.write(file_path, arcname=arc_name)
+            if embeddings_path and embeddings_path.exists():    
+                zf.write(embeddings_path, arcname=f"{tracker_name}_embeddings.npz")
         buf.seek(0)
         zip_bytes = buf.read()
 
@@ -392,8 +402,8 @@ async def process_tracking(
         raise HTTPException(status_code=500, detail=f"Errore durante il tracking: {e}")
 
     finally:
-        for p in (saved_video_path, tracked_video_path, h264_video_path, tmp_csv):
-            if p.exists():
+        for p in (saved_video_path, tracked_video_path, h264_video_path, tmp_csv, embeddings_path):
+            if p and p.exists():
                 try:
                     os.remove(p)
                 except Exception:
@@ -478,6 +488,12 @@ async def process_tracking_multi(
             tracker_instance = TrackerClass(**tracker_params)
             results          = tracker_instance.run(filtered_dets, par_video_path=str(saved_video_path))
             results = tracker_instance._remap_track_ids(results)
+            
+            embeddings_npz = None                                   # ← AGGIUNGI
+            if hasattr(tracker_instance, 'save_embeddings'):
+                video_id = Path(saved_video_path.name).stem
+                embeddings_npz = TMP_DIR / f"multi_{idx}_{tracker_name}_embeddings.npz"
+                tracker_instance.save_embeddings(video_id=f"{video_id}__{tracker_name}", out_path=str(embeddings_npz))
 
             csv_data = _csv_bytes(results, tracker_name, params=tracker_params)
 
@@ -495,6 +511,7 @@ async def process_tracking_multi(
                 "idx": idx, "tracker_name": tracker_name, "target_class": target_class,
                 "csv_key": f"{target_class}_{tracker_name.lower()}", "csv_data": csv_data,
                 "tmp_csv": tmp_csv, "fte": fte,
+                "embeddings_npz": embeddings_npz,
             }
 
         # Tracker indipendenti tra loro: eseguiti in parallelo (thread pool).
@@ -512,6 +529,9 @@ async def process_tracking_multi(
             r = results_by_idx[idx]
             csv_entries[r["csv_key"]] = r["csv_data"]
             tmp_files.append(r["tmp_csv"])
+            
+            if r.get("embeddings_npz"):
+                tmp_files.append(r["embeddings_npz"])
 
             if extract_crops and r["fte"]:
                 for frame_idx, items in r["fte"].items():
@@ -552,6 +572,11 @@ async def process_tracking_multi(
                         file_path = Path(root) / file
                         arc_name = f"crops/{file_path.relative_to(crops_dir)}"
                         zf.write(file_path, arcname=arc_name)
+            for idx in range(len(assignments)):                      # ← AGGIUNGI
+                r = results_by_idx[idx]
+                npz = r.get("embeddings_npz")
+                if npz and npz.exists():
+                    zf.write(npz, arcname=f"{r['tracker_name']}_embeddings.npz")
         buf.seek(0)
 
         return StreamingResponse(
