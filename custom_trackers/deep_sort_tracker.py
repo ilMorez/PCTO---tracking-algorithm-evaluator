@@ -145,7 +145,14 @@ class DeepSortTracker(BaseTracker):
             np.savez(out_path, **existing)
         else:
             np.savez(out_path, **new_data)
-
+    
+    def remap_embeddings(self, id_map: dict):
+        """id_map: {old_id: new_id}"""
+        self.track_embeddings = {
+            id_map[tid]: embs
+            for tid, embs in self.track_embeddings.items()
+            if tid in id_map
+        }
        
     def run(self, par_detections_data: list, par_video_path: str, progress_callback=None) -> list:
         results = []
@@ -212,7 +219,19 @@ class DeepSortTracker(BaseTracker):
                         })
                         if self.is_clip and embeds:
                             tid = int(t.track_id)
-                            self.track_embeddings.setdefault(tid, []).append(np.mean(embeds, axis=0))
+                            # trova la detection più vicina al bbox del track
+                            best_i, best_iou = 0, -1
+                            for i, (x1, y1, x2, y2, _) in enumerate(filtered_dets):
+                                inter_x1, inter_y1 = max(l, x1), max(t_y, y1)
+                                inter_x2, inter_y2 = min(r, x2), min(b, y2)
+                                inter = max(0, inter_x2-inter_x1) * max(0, inter_y2-inter_y1)
+                                union = (r-l)*(b-t_y) + (x2-x1)*(y2-y1) - inter
+                                iou = inter/union if union > 0 else 0
+                                if iou > best_iou:
+                                    best_iou, best_i = iou, i
+                            if best_iou > 0.3 and best_i < len(embeds):
+                                self.track_embeddings.setdefault(tid, []).append(embeds[best_i])
+
                 except Exception as tracker_err:
                     print(f"\n[ERRORE] Errore critico nel loop delle tracce al frame {frame_number}: {tracker_err}")
                     traceback.print_exc()
@@ -228,5 +247,5 @@ class DeepSortTracker(BaseTracker):
         finally:
             print("Rilascio della risorsa VideoCapture in corso...")
             cap.release()
-            
+
         return results
