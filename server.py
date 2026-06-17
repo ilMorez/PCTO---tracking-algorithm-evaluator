@@ -109,33 +109,55 @@ def _make_zip(video_path: Path, csv_data: bytes, tracker_name: str) -> bytes:
     return buf.read()
 
 
+def _build_id_map(results_before: list, results_after: list) -> dict:
+    """Costruisce {old_track_id: new_track_id} confrontando i risultati prima e dopo il remap.
+    
+    Usa il primo frame in cui appare ogni track_id per associare old → new tramite bbox.
+    """
+    before_by_frame = defaultdict(dict)
+    for r in results_before:
+        before_by_frame[r["frame"]][r["track_id"]] = (r["x1"], r["y1"], r["x2"], r["y2"])
+
+    after_by_frame = defaultdict(dict)
+    for r in results_after:
+        after_by_frame[r["frame"]][r["track_id"]] = (r["x1"], r["y1"], r["x2"], r["y2"])
+
+    id_map = {}
+    for frame, before_tracks in before_by_frame.items():
+        after_tracks = after_by_frame.get(frame, {})
+        for old_id, bbox in before_tracks.items():
+            if old_id in id_map:
+                continue
+            for new_id, bbox_after in after_tracks.items():
+                if bbox == bbox_after:
+                    id_map[old_id] = new_id
+                    break
+
+    return id_map
+
+
 def _compute_crops_to_extract(results: list, W: int, H: int, tracker_name: str,
                                num_crops=5, margin=5, default_class="unknown"):
     """Calcola, per un tracker, quali (frame, classe, track_id, bbox) estrarre. Non apre il video."""
-    # 1. Filtra le bbox che toccano i bordi dell'inquadratura (con un piccolo margine)
     valid_results = []
     for r in results:
         x1, y1, x2, y2 = r['x1'], r['y1'], r['x2'], r['y2']
         if x1 > margin and y1 > margin and x2 < (W - margin) and y2 < (H - margin):
             valid_results.append(r)
 
-    # 2. Raggruppa per Classe e poi per Track ID
     tracks_by_class = defaultdict(lambda: defaultdict(list))
     for r in valid_results:
         cls_name = r.get('class_name') or r.get('label') or default_class
         tracks_by_class[cls_name][r['track_id']].append(r)
 
-    # 3. Seleziona fino a `num_crops` frame equispaziati nel tempo per ogni oggetto
     frames_to_extract = defaultdict(list)
     for cls_name, tracks in tracks_by_class.items():
         for t_id, records in tracks.items():
             records = sorted(records, key=lambda x: x['frame'])
             if not records:
                 continue
-
             step = max(1, len(records) // num_crops)
             selected_records = records[::step][:num_crops]
-
             for rec in selected_records:
                 frames_to_extract[rec['frame']].append((tracker_name, cls_name, t_id, rec))
 
@@ -143,10 +165,7 @@ def _compute_crops_to_extract(results: list, W: int, H: int, tracker_name: str,
 
 
 def _write_crops_single_pass(video_path: str, output_base_dir: Path, frames_to_extract: dict, W: int, H: int):
-    """Una singola passata sul video: scrive i crop richiesti da uno o più tracker.
-
-    frames_to_extract: {frame_idx: [(tracker_name, cls_name, track_id, rec), ...]}
-    """
+    """Una singola passata sul video: scrive i crop richiesti da uno o più tracker."""
     import cv2
 
     if not frames_to_extract:
@@ -165,16 +184,14 @@ def _write_crops_single_pass(video_path: str, output_base_dir: Path, frames_to_e
         if frame_idx in frames_to_extract:
             for tracker_name, cls_name, t_id, det in frames_to_extract[frame_idx]:
                 x1, y1, x2, y2 = int(det['x1']), int(det['y1']), int(det['x2']), int(det['y2'])
-
-                # Clip per sicurezza coordinate
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(W, x2), min(H, y2)
-
                 crop = frame[y1:y2, x1:x2]
                 if crop.size > 0:
                     folder = output_base_dir / str(tracker_name) / str(cls_name) / str(t_id)
                     folder.mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(folder / f"frame_{frame_idx}.jpg"), crop)
+                    import cv2 as _cv2
+                    _cv2.imwrite(str(folder / f"frame_{frame_idx}.jpg"), crop)
 
         frame_idx += 1
 
@@ -185,7 +202,6 @@ def extract_track_crops(video_path: str, results: list, output_base_dir: Path, t
                          num_crops=5, margin=5, default_class="unknown"):
     """
     Estrae i crop delle bbox dal video originale per ogni track_id unico (singolo tracker).
-    Scarta le bbox che toccano i bordi dell'inquadratura ed estrae ~num_crops frame equispaziati.
     Struttura finale: output_base_dir / tracker_name / nome_classe / track_id / frame_X.jpg
     """
     import cv2
@@ -211,7 +227,7 @@ def extract_track_crops(video_path: str, results: list, output_base_dir: Path, t
 async def process_detection(
     model_name:          str        = Form(...),
     yolo_params_json:    str        = Form("{}"),
-    target_classes_json: str        = Form('["car"]'),   
+    target_classes_json: str        = Form('["car"]'),
     video:               UploadFile = File(...),
 ):
     try:
@@ -251,9 +267,6 @@ async def process_detection(
         converted = _to_h264(raw_video_path, h264_video_path)
         cached_video_path = h264_video_path if (converted and h264_video_path.exists()) else None
 
-        # Salva le detections (e il path del video grezzo h264) in cache,
-        # così le chiamate successive a /api/track* possono riferirle via ID
-        # invece di ritrasmetterle, e il video può essere scaricato in streaming.
         detection_id = _store_detections(detections, cached_video_path)
 
         return JSONResponse({
@@ -292,8 +305,8 @@ async def process_tracking(
     detections_json:     str | None = Form(None),
     detection_id:        str | None = Form(None),
     tracker_params_json: str        = Form("{}"),
-    target_class:        str        = Form(""),       
-    extract_crops:       bool       = Form(False), 
+    target_class:        str        = Form(""),
+    extract_crops:       bool       = Form(False),
     video:               UploadFile = File(...),
 ):
     if tracker_name not in TRACKER_REGISTRY:
@@ -304,7 +317,6 @@ async def process_tracking(
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Formato JSON non valido (tracker_params_json).")
 
-    # Preferisce il detection_id (dati già in cache sul server); fallback su detections_json.
     detections_data = None
     if detection_id:
         detections_data = _get_detections(detection_id)
@@ -338,16 +350,22 @@ async def process_tracking(
 
         TrackerClass     = TRACKER_REGISTRY[tracker_name]
         tracker_instance = TrackerClass(**tracker_params)
-        results          = tracker_instance.run(detections_data, par_video_path=str(saved_video_path))
-        results = tracker_instance._remap_track_ids(results)
-        
-        embeddings_path = None                                
+        results_before   = tracker_instance.run(detections_data, par_video_path=str(saved_video_path))
+        results          = tracker_instance._remap_track_ids(results_before)
+
+        embeddings_path = None
         if hasattr(tracker_instance, 'save_embeddings'):
             video_id = Path(video.filename).stem
+            # Costruisce il mapping old_id → new_id per allineare gli embedding al remap
+            id_map = _build_id_map(results_before, results)
+            if hasattr(tracker_instance, 'remap_embeddings'):
+                tracker_instance.remap_embeddings(id_map)
             embeddings_npz = TMP_DIR / f"{tracker_name}_{video_id}_embeddings.npz"
-            tracker_instance.save_embeddings(video_id=video_id, out_path=str(embeddings_npz))
+            tracker_instance.save_embeddings(
+                video_id=f"{video_id}__{tracker_name}__{target_class or 'all'}",
+                out_path=str(embeddings_npz)
+            )
             embeddings_path = embeddings_npz
-
 
         csv_data = _csv_bytes(results, tracker_name, params=tracker_params)
         tmp_csv.write_bytes(csv_data)
@@ -365,7 +383,6 @@ async def process_tracking(
         if not video_src.exists():
             raise RuntimeError("Generazione video tracciato fallita.")
 
-        # Esegui l'estrazione dei crop se richiesto (dal video sorgente originale, pulito!)
         if extract_crops:
             extract_track_crops(
                 video_path=str(saved_video_path),
@@ -375,20 +392,21 @@ async def process_tracking(
                 default_class=target_class or "unknown"
             )
 
-        # Costruzione dinamica dello ZIP per supportare la cartella dei crop
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(video_src, arcname=f"{tracker_name.lower()}_tracked.mp4")
             zf.writestr(f"{tracker_name.lower()}_tracking.csv", csv_data)
-            
+
             if extract_crops and crops_dir.exists():
                 for root, _, files in os.walk(crops_dir):
                     for file in files:
                         file_path = Path(root) / file
                         arc_name = f"crops/{file_path.relative_to(crops_dir)}"
                         zf.write(file_path, arcname=arc_name)
-            if embeddings_path and embeddings_path.exists():    
-                zf.write(embeddings_path, arcname=f"{tracker_name}_embeddings.npz")
+
+            if embeddings_path and embeddings_path.exists():
+                zf.write(embeddings_path, arcname=f"{tracker_name}_{target_class or 'all'}_embeddings.npz")
+
         buf.seek(0)
         zip_bytes = buf.read()
 
@@ -429,7 +447,6 @@ async def process_tracking_multi(
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Formato JSON non valido (assignments_json).")
 
-    # Preferisce il detection_id (dati già in cache sul server); fallback su detections_json.
     detections_data = None
     if detection_id:
         detections_data = _get_detections(detection_id)
@@ -450,7 +467,7 @@ async def process_tracking_multi(
         if a.get("tracker_name") not in TRACKER_REGISTRY:
             raise HTTPException(status_code=400, detail=f"Tracker '{a.get('tracker_name')}' non supportato.")
 
-    saved_video_path = TMP_DIR / video.filename
+    saved_video_path  = TMP_DIR / video.filename
     merged_video_path = TMP_DIR / f"{video.filename}.multi.mp4"
     h264_merged_path  = TMP_DIR / f"{video.filename}.multi_h264.mp4"
     crops_dir         = TMP_DIR / f"{video.filename}_multi_crops"
@@ -464,7 +481,7 @@ async def process_tracking_multi(
     tmp_files = [saved_video_path, merged_video_path, h264_merged_path]
 
     try:
-        track_layers = []   
+        track_layers = []
         csv_entries  = {}
         all_frames_to_extract = defaultdict(list)
         cap_w = cap_h = None
@@ -482,22 +499,26 @@ async def process_tracking_multi(
 
             print(f"=== Multi-track [{idx+1}/{len(assignments)}]: {tracker_name} → {target_class} ===")
 
-            filtered_dets = filter_detections_by_class(detections_data, target_class)
-
+            filtered_dets    = filter_detections_by_class(detections_data, target_class)
             TrackerClass     = TRACKER_REGISTRY[tracker_name]
             tracker_instance = TrackerClass(**tracker_params)
-            results          = tracker_instance.run(filtered_dets, par_video_path=str(saved_video_path))
-            results = tracker_instance._remap_track_ids(results)
-            
-            embeddings_npz = None                                   # ← AGGIUNGI
+            results_before   = tracker_instance.run(filtered_dets, par_video_path=str(saved_video_path))
+            results          = tracker_instance._remap_track_ids(results_before)
+
+            embeddings_npz = None
             if hasattr(tracker_instance, 'save_embeddings'):
                 video_id = Path(saved_video_path.name).stem
+                id_map = _build_id_map(results_before, results)
+                if hasattr(tracker_instance, 'remap_embeddings'):
+                    tracker_instance.remap_embeddings(id_map)
                 embeddings_npz = TMP_DIR / f"multi_{idx}_{tracker_name}_embeddings.npz"
-                tracker_instance.save_embeddings(video_id=f"{video_id}__{tracker_name}", out_path=str(embeddings_npz))
+                tracker_instance.save_embeddings(
+                    video_id=f"{video_id}__{tracker_name}__{target_class}",
+                    out_path=str(embeddings_npz)
+                )
 
             csv_data = _csv_bytes(results, tracker_name, params=tracker_params)
-
-            tmp_csv = TMP_DIR / f"multi_{idx}_{tracker_name}.csv"
+            tmp_csv  = TMP_DIR / f"multi_{idx}_{tracker_name}.csv"
             tmp_csv.write_bytes(csv_data)
 
             fte = None
@@ -514,8 +535,6 @@ async def process_tracking_multi(
                 "embeddings_npz": embeddings_npz,
             }
 
-        # Tracker indipendenti tra loro: eseguiti in parallelo (thread pool).
-        # Non parallelizzare la detection YOLO/GPU: causerebbe contention sulla GPU.
         max_workers = min(len(assignments), os.cpu_count() or 4)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_run_single_assignment, idx, a): idx
@@ -529,7 +548,7 @@ async def process_tracking_multi(
             r = results_by_idx[idx]
             csv_entries[r["csv_key"]] = r["csv_data"]
             tmp_files.append(r["tmp_csv"])
-            
+
             if r.get("embeddings_npz"):
                 tmp_files.append(r["embeddings_npz"])
 
@@ -544,7 +563,6 @@ async def process_tracking_multi(
                 "label":    r["target_class"],
             })
 
-        # Singola passata sul video per scrivere tutti i crop di tutti gli assignment
         if extract_crops and all_frames_to_extract:
             _write_crops_single_pass(str(saved_video_path), crops_dir, all_frames_to_extract, cap_w, cap_h)
 
@@ -572,11 +590,13 @@ async def process_tracking_multi(
                         file_path = Path(root) / file
                         arc_name = f"crops/{file_path.relative_to(crops_dir)}"
                         zf.write(file_path, arcname=arc_name)
-            for idx in range(len(assignments)):                      # ← AGGIUNGI
-                r = results_by_idx[idx]
+
+            for idx in range(len(assignments)):
+                r   = results_by_idx[idx]
                 npz = r.get("embeddings_npz")
                 if npz and npz.exists():
-                    zf.write(npz, arcname=f"{r['tracker_name']}_embeddings.npz")
+                    zf.write(npz, arcname=f"{r['tracker_name']}_{r['target_class']}_embeddings.npz")
+
         buf.seek(0)
 
         return StreamingResponse(
