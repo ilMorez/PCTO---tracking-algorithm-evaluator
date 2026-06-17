@@ -31,7 +31,6 @@ if "detection_id" not in st.session_state:
 if "detections_video_key" not in st.session_state:
     st.session_state["detections_video_key"] = None
 
-# Classi YOLO comuni — l'utente può aggiungerne altre via text_input
 DEFAULT_YOLO_CLASSES = [
     "person", "car", "truck", "bus", "motorcycle", "bicycle",
     "dog", "cat", "bird", "boat", "aeroplane", "train",
@@ -178,7 +177,7 @@ def server_fetch_detect_video(detection_id: str):
 
 def server_track(video_path: Path, tracker_name: str, detections_data: list,
                  tracker_params: dict, target_class: str = "", extract_crops: bool = False,
-                 output_dir: Path = None, detection_id: str = None):
+                 output_dir: Path = None, detection_id: str = None, embeddings_dir: Path = None):
     endpoint = f"{SERVER_URL}/api/track"
     try:
         data = {
@@ -229,11 +228,14 @@ def server_track(video_path: Path, tracker_name: str, detections_data: list,
                 if member.filename.startswith("crops/") and len(member.filename) > 6:
                     if member.filename.endswith('/'):
                         continue
-                    # Rimuove il prefisso 'crops/' così estrae direttamente la cartella classe accanto al CSV
                     rel_path = Path(member.filename).relative_to("crops")
                     target_path = output_dir / rel_path
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     target_path.write_bytes(zf.read(member))
+        
+        npz_name = next((n for n in names if n.endswith("_embeddings.npz")), None)
+        if npz_name and embeddings_dir:
+            (embeddings_dir / Path(npz_name).name).write_bytes(zf.read(npz_name))
         
         results = []
         if csv_bytes:
@@ -300,6 +302,13 @@ def server_track_multi(video_path: Path, assignments: list, detections_data: lis
                     target_path = output_dir / rel_path
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     target_path.write_bytes(zf.read(member))
+        
+        for npz_name in (n for n in names if n.endswith("_embeddings.npz")):
+            if output_dir:
+                tracker_name = Path(npz_name).name.split("_")[0]
+                tracker_subdir = output_dir / tracker_name
+                tracker_subdir.mkdir(parents=True, exist_ok=True)
+                (tracker_subdir / Path(npz_name).name).write_bytes(zf.read(npz_name))
         
         csv_map = {n.replace("_tracking.csv", ""): zf.read(n) for n in csv_names}
         return video_bytes, csv_map
@@ -505,11 +514,12 @@ if uploaded_file is not None:
         st.info("Premi **Avvia Detection** per caricare le detection prima di usare i tracker.")
         st.stop()
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Tracking Singolo",
         "Multi-Classe (un tracker per classe)",
         "Tracker VS Tracker",
         "Comparazione Analytics",
+        "Ricerca Semantica",
     ])
 
     # -----------------------------------------------------------------------
@@ -546,6 +556,7 @@ if uploaded_file is not None:
                     video_salvato_path, tracker_type, detections_data,
                     tracker_kwargs, target_class=single_class,
                     extract_crops=extract_crops, output_dir=video_output_folder,
+                    embeddings_dir=tracker_dir,
                     detection_id=detection_id,
                 )
             if risultati is None:
@@ -798,3 +809,99 @@ if uploaded_file is not None:
                             st.bar_chart(df_filtrato[col_2], color=lista_colori[(i+1) % len(lista_colori)], height=450)
         else:
             st.info("Nessuna metrica disponibile. Avvia l'elaborazione di almeno un tracker.")
+            
+    # -----------------------------------------------------------------------
+    # TAB 5 — Ricerca Semantica negli Embedding
+    # -----------------------------------------------------------------------
+    with tab5:
+        st.subheader("Ricerca Semantica nei Crop")
+
+        # Trova tutti i tracker disponibili (cartelle con almeno un .npz)
+        available_trackers = [
+            d for d in video_output_folder.iterdir()
+            if d.is_dir() and any(d.glob("*_embeddings.npz"))
+        ]
+
+        if not available_trackers:
+            st.info("Nessun embedding disponibile. Avvia prima un tracking con DeepSORT.")
+        else:
+            tracker_names = [d.name for d in available_trackers]
+            selected_tracker_name = st.selectbox(
+                "Seleziona tracker:", tracker_names, key="tab5_tracker"
+            )
+            selected_tracker_dir = video_output_folder / selected_tracker_name
+
+            # Trova tutti gli .npz del tracker selezionato
+            npz_files = sorted(selected_tracker_dir.glob("*_embeddings.npz"))
+            npz_names = [f.name for f in npz_files]
+
+            selected_npz_name = st.selectbox(
+                "Seleziona file embedding (classe):", npz_names, key="tab5_npz"
+            )
+            selected_npz_path = selected_tracker_dir / selected_npz_name
+
+            # Ricava la classe dal nome file (DeepSORT_car_embeddings.npz → car)
+            npz_stem_parts = selected_npz_name.replace("_embeddings.npz", "").split("_")
+            embedding_class = npz_stem_parts[-1] if len(npz_stem_parts) > 1 else "unknown"
+
+            text_query = st.text_input(
+                "Query testuale (es. 'red car', 'person with backpack'):",
+                key="tab5_query"
+            )
+            top_k = st.slider("Numero risultati da mostrare:", 1, 20, 5, key="tab5_topk")
+
+            if st.button("Cerca", key="tab5_search"):
+                if not text_query.strip():
+                    st.warning("Inserisci una query testuale.")
+                else:
+                    try:
+                        from transformers import CLIPProcessor, CLIPModel
+                        import torch
+                        import numpy as np
+
+                        with st.spinner("Calcolo embedding testuale..."):
+                            device = "cuda" if torch.cuda.is_available() else "cpu"
+                            model  = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+                            proc   = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+                            inputs = proc(text=[text_query], return_tensors="pt", padding=True).to(device)
+                            with torch.no_grad():
+                                feat = model.get_text_features(**inputs)
+                            if hasattr(feat, 'pooler_output'):
+                                feat = feat.pooler_output
+                            elif hasattr(feat, 'last_hidden_state'):
+                                feat = feat.last_hidden_state.mean(dim=1)
+                            feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
+                            text_embed = feat.cpu().numpy()[0]
+
+                        db  = np.load(selected_npz_path)
+                        keys   = list(db.files)
+                        matrix = np.stack([db[k] for k in keys])
+                        sims   = matrix @ text_embed
+                        top_idx = np.argsort(sims)[::-1][:top_k]
+
+                        st.markdown(f"**Top {top_k} tracce per query: '{text_query}'**")
+
+                        for rank, i in enumerate(top_idx):
+                            key      = keys[i]
+                            sim      = float(sims[i])
+                            track_id = key.split("__")[-1]
+
+                            crop_dir = selected_tracker_dir / embedding_class / track_id
+                            st.markdown(f"**#{rank+1} — Track {track_id} — similarità: {sim:.4f}**")
+
+                            if crop_dir.exists():
+                                frames = sorted(crop_dir.glob("*.jpg"))
+                                if frames:
+                                    # Mostra fino a 6 frame per traccia
+                                    cols = st.columns(min(len(frames), 6))
+                                    for col, frame_path in zip(cols, frames[:6]):
+                                        col.image(str(frame_path), width='stretch')
+                                else:
+                                    st.caption("Nessun crop disponibile per questa traccia.")
+                            else:
+                                st.caption(f"Cartella crop non trovata: `{crop_dir}`")
+
+                    except ImportError:
+                        st.error("transformers e torch non sono installati sul client.")
+                    except Exception as e:
+                        st.error(f"Errore: {e}")
