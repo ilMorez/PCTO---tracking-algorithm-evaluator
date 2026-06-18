@@ -5,14 +5,16 @@ from pathlib import Path
 
 # Palette colori BGR per classi diverse
 CLASS_COLOR_PALETTE = [
-    (0,   128, 255),   # arancione chiaro
-    (255, 128,   0),   # azzurro
-    (0,   255,   0),   # verde
-    (0,   0,   255),   # rosso
-    (255, 165,   0),   # arancione
-    (255,   0, 255),   # magenta
-    (0,   255, 255),   # giallo
-    (128,   0, 128),   # viola
+    (0, 0, 255),       # rosso
+    (0, 255, 0),       # verde
+    (255, 0, 0),       # blu
+    (0, 255, 255),     # giallo
+    (255, 0, 255),     # magenta
+    (255, 255, 0),     # ciano
+    (128, 0, 255),     # arancione
+    (255, 128, 0),     # azzurro
+    (128, 255, 0),     # lime
+    (0, 128, 255),     # rosa
 ]
 
 def get_class_color(index: int):
