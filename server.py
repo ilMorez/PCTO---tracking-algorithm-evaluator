@@ -1,14 +1,10 @@
 import os
 import io
-import csv
 import json
-import time
 import uuid
 import shutil
 import zipfile
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import subprocess
 from pathlib import Path
 from collections import defaultdict
 
@@ -19,204 +15,18 @@ from custom_trackers import TRACKER_REGISTRY
 from detection import Detector, filter_detections_by_class
 from visualization import Visualizer, get_class_color
 
-# Comando di avvio: uvicorn server:app --host 0.0.0.0 --port 8000
+# Moduli interni
+from utils_server.cache_manager import _store_detections, _get_detections, _get_cached_raw_video
+from utils_server.utils import TMP_DIR, _to_h264, _csv_bytes, _build_id_map
+from utils_server.crop_processor import (
+    extract_track_crops,
+    _compute_crops_to_extract,
+    _write_crops_single_pass,
+    _classify_color_hsv,
+    _run_yolo_on_crop,
+)
 
 app = FastAPI(title="Tracking Evaluator API Service")
-
-TMP_DIR = Path("server_tmp_videos")
-TMP_DIR.mkdir(exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# Cache delle detection per evitare di ritrasmettere detections_json a ogni
-# chiamata di tracking. Le voci scadono dopo DETECTION_CACHE_TTL secondi.
-# ---------------------------------------------------------------------------
-DETECTION_CACHE: dict[str, dict] = {}
-DETECTION_CACHE_TTL = 3600  # 1 ora
-_cache_lock = threading.Lock()
-
-
-def _store_detections(detections: list, raw_video_path: Path | None) -> str:
-    detection_id = uuid.uuid4().hex
-    with _cache_lock:
-        DETECTION_CACHE[detection_id] = {
-            "detections": detections,
-            "raw_video": str(raw_video_path) if raw_video_path else None,
-            "created":    time.time(),
-        }
-    return detection_id
-
-
-def _get_detections(detection_id: str) -> list | None:
-    with _cache_lock:
-        entry = DETECTION_CACHE.get(detection_id)
-        if not entry:
-            return None
-        if time.time() - entry["created"] > DETECTION_CACHE_TTL:
-            DETECTION_CACHE.pop(detection_id, None)
-            _cleanup_cached_video(entry)
-            return None
-        return entry["detections"]
-
-
-def _get_cached_raw_video(detection_id: str) -> Path | None:
-    with _cache_lock:
-        entry = DETECTION_CACHE.get(detection_id)
-        if not entry or not entry.get("raw_video"):
-            return None
-        p = Path(entry["raw_video"])
-        return p if p.exists() else None
-
-
-def _cleanup_cached_video(entry: dict):
-    raw = entry.get("raw_video")
-    if raw and Path(raw).exists():
-        try:
-            os.remove(raw)
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _to_h264(input_path: Path, output_path: Path) -> bool:
-    result = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(input_path),
-         "-vcodec", "libx264", "-an", "-crf", "23", "-preset", "fast",
-         str(output_path)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    return result.returncode == 0
-
-
-def _csv_bytes(results: list, tracker_name: str, params: dict = None) -> bytes:
-    buf = io.StringIO()
-    if params:
-        buf.write(f"# params: {json.dumps(params)}\n")
-    writer = csv.DictWriter(buf, fieldnames=["frame", "track_id", "x1", "y1", "x2", "y2", "time"])
-    writer.writeheader()
-    writer.writerows(results)
-    return buf.getvalue().encode()
-
-
-def _make_zip(video_path: Path, csv_data: bytes, tracker_name: str) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(video_path, arcname=f"{tracker_name}_tracked.mp4")
-        zf.writestr(f"{tracker_name}_tracking.csv", csv_data)
-    buf.seek(0)
-    return buf.read()
-
-
-def _build_id_map(results_before: list, results_after: list) -> dict:
-    """Costruisce {old_track_id: new_track_id} confrontando i risultati prima e dopo il remap.
-    
-    Usa il primo frame in cui appare ogni track_id per associare old → new tramite bbox.
-    """
-    before_by_frame = defaultdict(dict)
-    for r in results_before:
-        before_by_frame[r["frame"]][r["track_id"]] = (r["x1"], r["y1"], r["x2"], r["y2"])
-
-    after_by_frame = defaultdict(dict)
-    for r in results_after:
-        after_by_frame[r["frame"]][r["track_id"]] = (r["x1"], r["y1"], r["x2"], r["y2"])
-
-    id_map = {}
-    for frame, before_tracks in before_by_frame.items():
-        after_tracks = after_by_frame.get(frame, {})
-        for old_id, bbox in before_tracks.items():
-            if old_id in id_map:
-                continue
-            for new_id, bbox_after in after_tracks.items():
-                if bbox == bbox_after:
-                    id_map[old_id] = new_id
-                    break
-
-    return id_map
-
-
-def _compute_crops_to_extract(results: list, W: int, H: int, tracker_name: str,
-                               num_crops=5, margin=5, default_class="unknown"):
-    """Calcola, per un tracker, quali (frame, classe, track_id, bbox) estrarre. Non apre il video."""
-    valid_results = []
-    for r in results:
-        x1, y1, x2, y2 = r['x1'], r['y1'], r['x2'], r['y2']
-        if x1 > margin and y1 > margin and x2 < (W - margin) and y2 < (H - margin):
-            valid_results.append(r)
-
-    tracks_by_class = defaultdict(lambda: defaultdict(list))
-    for r in valid_results:
-        cls_name = r.get('class_name') or r.get('label') or default_class
-        tracks_by_class[cls_name][r['track_id']].append(r)
-
-    frames_to_extract = defaultdict(list)
-    for cls_name, tracks in tracks_by_class.items():
-        for t_id, records in tracks.items():
-            records = sorted(records, key=lambda x: x['frame'])
-            if not records:
-                continue
-            step = max(1, len(records) // num_crops)
-            selected_records = records[::step][:num_crops]
-            for rec in selected_records:
-                frames_to_extract[rec['frame']].append((tracker_name, cls_name, t_id, rec))
-
-    return frames_to_extract
-
-
-def _write_crops_single_pass(video_path: str, output_base_dir: Path, frames_to_extract: dict, W: int, H: int):
-    """Una singola passata sul video: scrive i crop richiesti da uno o più tracker."""
-    import cv2
-
-    if not frames_to_extract:
-        return
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return
-
-    frame_idx = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if frame_idx in frames_to_extract:
-            for tracker_name, cls_name, t_id, det in frames_to_extract[frame_idx]:
-                x1, y1, x2, y2 = int(det['x1']), int(det['y1']), int(det['x2']), int(det['y2'])
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(W, x2), min(H, y2)
-                crop = frame[y1:y2, x1:x2]
-                if crop.size > 0:
-                    folder = output_base_dir / str(tracker_name) / str(cls_name) / str(t_id)
-                    folder.mkdir(parents=True, exist_ok=True)
-                    import cv2 as _cv2
-                    _cv2.imwrite(str(folder / f"frame_{frame_idx}.jpg"), crop)
-
-        frame_idx += 1
-
-    cap.release()
-
-
-def extract_track_crops(video_path: str, results: list, output_base_dir: Path, tracker_name: str,
-                         num_crops=5, margin=5, default_class="unknown"):
-    """
-    Estrae i crop delle bbox dal video originale per ogni track_id unico (singolo tracker).
-    Struttura finale: output_base_dir / tracker_name / nome_classe / track_id / frame_X.jpg
-    """
-    import cv2
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-
-    frames_to_extract = _compute_crops_to_extract(
-        results, W, H, tracker_name, num_crops=num_crops, margin=margin, default_class=default_class
-    )
-    _write_crops_single_pass(video_path, output_base_dir, frames_to_extract, W, H)
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +166,6 @@ async def process_tracking(
         embeddings_path = None
         if hasattr(tracker_instance, 'save_embeddings'):
             video_id = Path(video.filename).stem
-            # Costruisce il mapping old_id → new_id per allineare gli embedding al remap
             id_map = _build_id_map(results_before, results)
             if hasattr(tracker_instance, 'remap_embeddings'):
                 tracker_instance.remap_embeddings(id_map)
@@ -617,3 +426,142 @@ async def process_tracking_multi(
                     pass
         if crops_dir.exists():
             shutil.rmtree(crops_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# /api/analyze_crops  — post-processing YOLO-E sui crop estratti dal tracker
+# ---------------------------------------------------------------------------
+
+@app.post("/api/analyze_crops")
+async def analyze_crops(
+    crops_zip:        UploadFile = File(...),
+    model_name:       str        = Form("yoloe-26s-seg.pt"),
+    attributes_json:  str        = Form('["color", "vehicle_type"]'),
+    conf_threshold:   float      = Form(0.25),
+    top_n_crops:      int        = Form(5),
+):
+    try:
+        attributes = json.loads(attributes_json)
+        if not isinstance(attributes, list) or not attributes:
+            raise ValueError
+    except Exception:
+        raise HTTPException(status_code=400, detail="attributes_json non valido.")
+
+    tmp_zip_path  = TMP_DIR / f"{uuid.uuid4().hex}_crops.zip"
+    tmp_crops_dir = TMP_DIR / f"{uuid.uuid4().hex}_crops_extracted"
+
+    try:
+        with tmp_zip_path.open("wb") as f:
+            shutil.copyfileobj(crops_zip.file, f)
+        with zipfile.ZipFile(tmp_zip_path, "r") as zf:
+            zf.extractall(tmp_crops_dir)
+
+        import cv2
+        import numpy as np
+
+        track_crops: dict[str, list[Path]] = {}
+        track_class: dict[str, str]        = {}
+
+        for img_path in sorted(tmp_crops_dir.rglob("*.jpg")):
+            parts = img_path.parts
+            if len(parts) >= 3:
+                track_id   = parts[-2]
+                class_name = parts[-3]
+                key        = f"{class_name}__{track_id}"
+                track_crops.setdefault(key, []).append(img_path)
+                track_class[key] = class_name
+
+        if not track_crops:
+            raise HTTPException(status_code=400, detail="Nessun crop trovato nello ZIP.")
+
+        model = None
+        yolo_attrs = [a for a in attributes if a != "color"]
+        
+        if yolo_attrs:
+            from ultralytics import YOLO
+            model = YOLO(model_name)
+            
+            target_classes = []
+            for attr in yolo_attrs:
+                target_classes.append(attr)
+            
+            target_classes = list(set(target_classes))
+            if hasattr(model, 'set_classes'):
+                model.set_classes(target_classes)
+
+        results_out = {}
+
+        for key, img_paths in track_crops.items():
+            class_name = track_class[key]
+            track_id   = key.split("__", -1)[-1]
+            selected   = img_paths[:top_n_crops]
+
+            per_frame_results = []
+            aggregated: dict[str, list] = {attr: [] for attr in attributes}
+
+            for img_path in selected:
+                frame = cv2.imread(str(img_path))
+                if frame is None:
+                    continue
+
+                frame_attrs: dict[str, object] = {"frame": img_path.name}
+
+                if "color" in attributes:
+                    color_label, color_conf = _classify_color_hsv(frame)
+                    frame_attrs["color"] = color_label
+                    frame_attrs["color_confidence"] = round(color_conf, 3)
+                    aggregated["color"].append((color_label, color_conf))
+
+                if model is not None:
+                    yolo_preds = _run_yolo_on_crop(model, frame, conf_threshold)
+
+                    if "vehicle_type" in yolo_attrs:
+                        best = max(yolo_preds, key=lambda x: x["confidence"]) if yolo_preds else None
+                        frame_attrs["vehicle_type"] = best["class_name"] if best else None
+                        frame_attrs["vehicle_type_confidence"] = round(best["confidence"], 3) if best else 0.0
+                        if best:
+                            aggregated["vehicle_type"].append((best["class_name"], best["confidence"]))
+
+                    for attr in yolo_attrs:
+                        if attr == "vehicle_type":
+                            continue
+                        match = next((p for p in yolo_preds if p["class_name"].lower() == attr.lower()), None)
+                        frame_attrs[attr] = match["class_name"] if match else None
+                        frame_attrs[f"{attr}_confidence"] = round(match["confidence"], 3) if match else 0.0
+                        if match:
+                            aggregated[attr].append((match["class_name"], match["confidence"]))
+
+                per_frame_results.append(frame_attrs)
+
+            summary = {
+                "track_id": track_id,
+                "class": class_name,
+                "num_frames_analyzed": len(per_frame_results),
+                "per_frame": per_frame_results
+            }
+            overall_conf = []
+            for attr, votes in aggregated.items():
+                if not votes:
+                    summary[attr] = None
+                    summary[f"{attr}_confidence"] = 0.0
+                else:
+                    label_scores = {}
+                    for label, conf in votes:
+                        label_scores[label] = label_scores.get(label, 0.0) + conf
+                    best_label = max(label_scores, key=label_scores.__getitem__)
+                    summary[attr] = best_label
+                    summary[f"{attr}_confidence"] = round(label_scores[best_label] / len(votes), 3)
+                    overall_conf.append(label_scores[best_label] / len(votes))
+
+            summary["overall_confidence"] = round(sum(overall_conf) / len(overall_conf), 3) if overall_conf else 0.0
+            results_out[key] = summary
+
+        return JSONResponse({"status": "success", "results": results_out})
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore analyze_crops: {e}")
+    finally:
+        if tmp_zip_path.exists():
+            os.remove(tmp_zip_path)
+        if tmp_crops_dir.exists():
+            shutil.rmtree(tmp_crops_dir, ignore_errors=True)
