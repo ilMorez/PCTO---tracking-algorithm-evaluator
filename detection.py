@@ -49,6 +49,10 @@ class Detector:
         frame_number = 0
 
         self.model = YOLO(model_name)
+        
+        if "yoloe" in model_name.lower():
+            print("Configurazione classi YOLOE:", target_classes)
+            self.model.set_classes(target_classes)
 
         cap          = cv2.VideoCapture(par_video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))

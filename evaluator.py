@@ -182,6 +182,7 @@ class TrackerEvaluator:
         """ Legge il CSV di un tracker e ne calcola tutte le metriche di valutazione all'interno di un dict
         """
         df = pd.read_csv(par_csv_path, comment='#')
+        df = df[df["track_id"] != -1]
         lengths = self._compute_track_lengths(df)
         persistence = self._compute_id_persistence(df)
 
